@@ -1,0 +1,66 @@
+# ====================================================================
+# Xcode & Swift Project .gitignore
+# ====================================================================
+
+# Xcode Derleme Çıktıları ve Önbellekler
+build/
+DerivedData/
+*.moved-aside
+*.xcscmblueprint
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcarchive
+
+# Kullanıcıya Özel Xcode Verileri (Pencereler, breakpoint'ler, state)
+xcuserdata/
+*.xcuserstate
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+# Swift Package Manager (SPM)
+.build/
+Packages/
+Package.pins
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+.swiftpm/configuration/
+
+# CocoaPods (Gelecekte kullanılırsa)
+Pods/
+
+# Carthage (Gelecekte kullanılırsa)
+Carthage/Build/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# macOS Sistem Dosyaları
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Icon?
+
+# Editör ve IDE Ayarları
+.idea/
+.vscode/
+*.swp
+*~
+*.orig
+*.bak
+
+# Geçici Dosyalar ve Günlükler
+*.log
