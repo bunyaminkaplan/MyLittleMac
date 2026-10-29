@@ -55,7 +55,33 @@ final class AnalyzerService {
         var analyzedFiles: [ScannedFile] = []
 
         for file in files {
-            let determinedRisk = try await determineRiskLevel(
+            // UI Güvenlik Bariyeri: Gelişmiş aramadan dönen dosyaların discoveryMethod değeri .standard DEĞİLSE,
+            // arayüzdeki seçim kutuları (Checkbox) KESİNLİKLE varsayılan olarak kapalı (isSelectedForDeletion = false) başlatılacaktır.
+            // İSTİSNA: .heuristicOverride katmanı .safeToDelete olarak gelir ve silinmeye hazır (seçili) başlatılır.
+            if file.discoveryMethod != .standard {
+                let isSelected: Bool
+                if file.discoveryMethod == .heuristicOverride && file.riskLevel == .safeToDelete {
+                    isSelected = true
+                } else {
+                    isSelected = false
+                }
+
+                let analyzedFile = ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: file.riskLevel,
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: file.reasoningText,
+                    isSelectedForDeletion: isSelected
+                )
+                analyzedFiles.append(analyzedFile)
+                continue
+            }
+
+            let (determinedRisk, reasoning) = try await determineRiskLevelWithReasoning(
                 file: file,
                 app: app,
                 siblingBundleExists: siblingBundleExists
@@ -78,69 +104,171 @@ final class AnalyzerService {
                 fileType: file.fileType,
                 riskLevel: determinedRisk,
                 relatedBundleID: file.relatedBundleID,
+                discoveryMethod: file.discoveryMethod,
+                reasoningText: file.reasoningText ?? reasoning,
                 isSelectedForDeletion: isSelected
             )
 
             analyzedFiles.append(analyzedFile)
         }
 
-        return analyzedFiles
+        // Parent-Child çakışma çözümünü ve override izolasyonunu analiz edilen listede de garantiye al
+        let resolvedFiles = resolveParentChildCollisions(in: analyzedFiles, appUrl: app.mainAppUrl)
+
+        // UI Güvenlik Bariyeri: riskLevel değeri .safeToDelete olmayan HİÇBİR klasör varsayılan olarak seçili (true) başlatılamaz.
+        return resolvedFiles.map { file in
+            if file.riskLevel != .safeToDelete && file.isSelectedForDeletion {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: file.riskLevel,
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: file.reasoningText,
+                    isSelectedForDeletion: false
+                )
+            }
+            return file
+        }
+    }
+
+    // MARK: - Parent-Child Klasör Çakışması & Override İzolasyonu (Collision Resolution)
+
+    /// Eğer listede bir "Üst Klasör" VE aynı zamanda bu klasörün içindeki bir "Alt Klasör/Dosya" birlikte bulunuyorsa:
+    /// Üst klasörün riskLevel değerini KESİNLİKLE .highRisk (Kod: 2) olarak zorlar ve isSelectedForDeletion = false yapar.
+    private func resolveParentChildCollisions(in files: [ScannedFile], appUrl: URL) -> [ScannedFile] {
+        let standardizedPaths = files.map { $0.url.standardizedFileURL.path }
+        let standardizedAppPath = appUrl.standardizedFileURL.path
+
+        // .heuristicOverride ile gelen alt dosyaların standart yolları
+        let overrideChildPaths = files
+            .filter { $0.discoveryMethod == .heuristicOverride }
+            .map { $0.url.standardizedFileURL.path }
+
+        return files.map { file in
+            let parentPath = file.url.standardizedFileURL.path
+
+            if parentPath == standardizedAppPath || file.fileType == .appBundle {
+                return file
+            }
+
+            let parentPathWithSlash = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
+
+            // 1. Override İzolasyonu: overrides.json üzerinden .heuristicOverride ile bulunmuş
+            // spesifik alt dosyalar varsa, bu alt dosyaların ÜST KLASÖRÜNÜ KESİNLİKLE .highRisk yap
+            // ve isSelectedForDeletion = false olarak kilitle.
+            let hasOverrideChild = overrideChildPaths.contains { childPath in
+                childPath != parentPath && childPath.hasPrefix(parentPathWithSlash)
+            }
+
+            if hasOverrideChild {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: .highRisk,
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: "Güvenli alt klasörler (.heuristicOverride) bağımsız hedeflendiğinden üst klasör kullanıcı verilerini korumak amacıyla yüksek riskli (.highRisk) olarak kilitlendi",
+                    isSelectedForDeletion: false
+                )
+            }
+
+            // 2. Genel parent-child çakışması:
+            let hasChildInList = standardizedPaths.contains { childPath in
+                childPath != parentPath && childPath.hasPrefix(parentPathWithSlash)
+            }
+
+            if hasChildInList {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: .highRisk,
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: "Alt klasör/dosyaları bağımsız olarak listelendiğinden üst klasör yüksek riskli (.highRisk) olarak kilitlendi",
+                    isSelectedForDeletion: false
+                )
+            }
+
+            return file
+        }
     }
 
     // MARK: - Risk Belirleme (Adımlar 1–4)
 
-    /// Dosya için doğrulama adımlarını ardışık olarak işletir ve nihai risk seviyesini döner.
-    private func determineRiskLevel(
+    /// Dosya için doğrulama adımlarını ardışık olarak işletir ve nihai risk seviyesi ile gerekçesini döner.
+    private func determineRiskLevelWithReasoning(
         file: ScannedFile,
         app: ScannedApp,
         siblingBundleExists: Bool
-    ) async throws -> RiskLevel {
+    ) async throws -> (RiskLevel, String) {
 
         let path = file.url.path
 
         // ── Ana Uygulama (.app): Doğrudan silme hedefi ──
         if file.url == app.mainAppUrl || file.fileType == .appBundle {
-            return .safeToDelete
+            return (.safeToDelete, "Hedef uygulama ana paketi (.app)")
         }
 
         // ── Darwin Cache / Temp (/private/var/folders/): Doğrudan Bundle ID tam eşleşmesi ──
         if (path.contains("/var/folders/") || path.contains("/private/var/folders/")),
            file.url.lastPathComponent == app.bundleIdentifier {
-            return .safeToDelete
+            return (.safeToDelete, "Darwin dinamik önbellek (tam bundle ID eşleşmesi)")
+        }
+
+        // ── Darwin Cache / Temp (/private/var/folders/): Suffix / alt süreç dosyaları (hasPrefix) ──
+        if (path.contains("/var/folders/") || path.contains("/private/var/folders/")),
+           file.url.lastPathComponent.hasPrefix(app.bundleIdentifier) {
+            return (.unknown, file.reasoningText ?? "Darwin dinamik alt/yan süreç klasörü (suffix eşleşmesi: \(file.url.lastPathComponent))")
+        }
+
+        // ── Scanner tarafından .highRisk olarak zorlanmış dosyalar (Parent-Child çakışması vb.) ──
+        if file.riskLevel == .highRisk {
+            return (.highRisk, file.reasoningText ?? "Kök dizin / korumalı veya alt öğeleri bulunan üst klasör")
         }
 
         // ── Scanner tarafından zaten tam Bundle ID eşleşmesiyle güvenli kabul edilmiş dosyalar ──
         if file.riskLevel == .safeToDelete {
-            return .safeToDelete
+            return (.safeToDelete, file.reasoningText ?? "Bundle ID eşleşmesiyle güvenli kütüphane dosyası")
         }
 
         // ── Adım 1: LaunchDaemons ve LaunchAgents Doğrulaması ──
         if isPlistInLaunchServiceDirectory(file: file) {
-            return try await analyzeLaunchServicePlist(file: file, app: app)
+            let risk = try await analyzeLaunchServicePlist(file: file, app: app)
+            let reason = (risk == .safeToDelete)
+                ? "LaunchService plist hedef uygulamayı doğruladı"
+                : "LaunchService plist hedef uygulamayı doğrulamadı"
+            return (risk, reason)
         }
 
         // ── Adım 3: PKG ve System Root Dosyaları ──
         // (Adım 2'den önce kontrol ediyoruz çünkü root dizin her koşulda highRisk.)
         if isInRootProtectedDirectory(path: path) {
-            return .highRisk
+            return (.highRisk, "Kök dizin / yönetici izni gerektiren korumalı sistem yolu")
         }
 
         // ── Adım 2: Ortak Bağımlılıklar ve Dotfiles ──
         if isSharedDotfile(path: path) {
-            return .highRisk
+            return (.highRisk, "Ortak paylaşılan dotfile gizli dizini")
         }
 
         if siblingBundleExists && isInSharedApplicationSupport(path: path, bundleID: app.bundleIdentifier) {
-            return .sharedDependency
+            return (.sharedDependency, "Kardeş uygulamalarla paylaşılan Application Support dizini")
         }
 
         // ── Adım 4: Standart ve Güvenli Dosyalar ──
         if isStandardOwnedFile(path: path, bundleID: app.bundleIdentifier) {
-            return .safeToDelete
+            return (.safeToDelete, "Standart kütüphane dizini, CFBundleIdentifier eşleşmesi tam")
         }
 
         // Hiçbir kurala uymadıysa güvenli tarafta kal
-        return .unknown
+        return (.unknown, "Sahiplik ve risk kesinleştirilemedi")
     }
 
     // MARK: - Adım 1: LaunchDaemons / LaunchAgents Doğrulaması

@@ -16,9 +16,11 @@ final class ScannerService {
     // MARK: - Public API
 
     /// Ana tarama fonksiyonu. scanner_agent.md protokolünün tek çıktısıdır.
-    /// - Parameter appUrl: Seçilen `.app` paketinin URL'i.
+    /// - Parameters:
+    ///   - appUrl: Seçilen `.app` paketinin URL'i.
+    ///   - isAdvancedModeEnabled: Gelişmiş tarama protokollerinin (Team ID, BTM, System Extensions, Heuristics) tetiklenip tetiklenmeyeceği.
     /// - Returns: Bulunan tüm ilişkili dosyaların `[ScannedFile]` listesi.
-    func scan(appUrl: URL) async throws -> [ScannedFile] {
+    func scan(appUrl: URL, isAdvancedModeEnabled: Bool = false) async throws -> [ScannedFile] {
 
         // Adım 1: CFBundleIdentifier Çıkarımı
         let bundleID = try extractBundleIdentifier(from: appUrl)
@@ -31,6 +33,8 @@ final class ScannerService {
             fileType: .appBundle,
             riskLevel: .unknown,
             relatedBundleID: bundleID,
+            discoveryMethod: .standard,
+            reasoningText: "Hedef uygulama ana paketi (.app)",
             isSelectedForDeletion: false
         )
 
@@ -52,6 +56,9 @@ final class ScannerService {
         // Adım 5: Darwin Dynamic Cache/Temp Taraması (/private/var/folders/)
         let darwinCacheFiles = try await scanDarwinFolders(bundleID: bundleID)
 
+        // Adım 6: Crash & Logs Taraması (DiagnosticReports & CrashReporter)
+        let crashLogFiles = try scanCrashAndLogDirectories(appUrl: appUrl, bundleID: bundleID)
+
         // Ana .app paketinin kendisini yan dosyalardan çıkar (en başa tekil olarak eklenecek)
         discoveredURLs.remove(appUrl)
 
@@ -60,7 +67,12 @@ final class ScannerService {
             discoveredURLs.remove(darwinFile.url)
         }
 
-        // Bulunan her URL için ScannedFile objesi oluştur
+        // Crash & Log dosyalarının URL'lerini de discoveredURLs'ten çıkar (mükerrer olmasın ve .safeToDelete korunsun)
+        for crashFile in crashLogFiles {
+            discoveredURLs.remove(crashFile.url)
+        }
+
+        // Bulunan her URL için ScannedFile objesi oluştur (mdfind ve FileManager fallback standart aramaları -> .standard)
         let scannedFiles = discoveredURLs.map { url in
             ScannedFile(
                 id: UUID(),
@@ -69,12 +81,73 @@ final class ScannerService {
                 fileType: inferFileType(from: url),
                 riskLevel: .unknown,             // Doğrulama yapılamadığı için KESİNLİKLE .unknown
                 relatedBundleID: bundleID,
+                discoveryMethod: .standard,
+                reasoningText: nil,
                 isSelectedForDeletion: false      // .unknown risk → KESİNLİKLE false
             )
         }
 
-        // Ana uygulama en başta, ardından darwinCacheFiles ve diğer bulunan dosyalar
-        return [mainAppScannedFile] + darwinCacheFiles + scannedFiles
+        var allResults = [mainAppScannedFile] + darwinCacheFiles + crashLogFiles + scannedFiles
+
+        // Adım 7: Gelişmiş Tarama Protokolleri (advanced_protocols.md)
+        if isAdvancedModeEnabled {
+            async let teamIDTask = scanTeamIDGroupContainers(appUrl: appUrl, bundleID: bundleID)
+            async let btmTask = scanBTM(bundleID: bundleID)
+            async let extensionTask = scanSystemExtensions(bundleID: bundleID)
+            async let heuristicTask = scanHeuristics(appUrl: appUrl, bundleID: bundleID)
+            async let overrideTask = scanOverrides(bundleID: bundleID)
+
+            let (teamIDFiles, btmFiles, extensionFiles, heuristicFiles, overrideFiles) = await (
+                teamIDTask,
+                btmTask,
+                extensionTask,
+                heuristicTask,
+                overrideTask
+            )
+
+            let advancedFiles = teamIDFiles + btmFiles + extensionFiles + heuristicFiles + overrideFiles
+
+            var existingIndexByPath: [String: Int] = [:]
+            for (index, file) in allResults.enumerated() {
+                existingIndexByPath[file.url.standardizedFileURL.path] = index
+            }
+
+            for advFile in advancedFiles {
+                let path = advFile.url.standardizedFileURL.path
+                if let existingIndex = existingIndexByPath[path] {
+                    // Eğer dosya heuristicOverride ile gelmişse, genel aramayı override et
+                    if advFile.discoveryMethod == .heuristicOverride {
+                        allResults[existingIndex] = advFile
+                    }
+                } else {
+                    existingIndexByPath[path] = allResults.count
+                    allResults.append(advFile)
+                }
+            }
+        }
+
+        // Adım 8: Parent-Child Klasör Çakışması & Override İzolasyonu (Deduplication)
+        // Eğer listede bir "Üst Klasör" VE bu klasörün içinde bir "Alt Klasör/Dosya" birlikte bulunuyorsa,
+        // özellikle .heuristicOverride alt klasörlerinin üst klasörü KESİNLİKLE .highRisk ve isSelectedForDeletion = false yapılır.
+        let resolvedResults = resolveParentChildCollisions(in: allResults, appUrl: appUrl)
+
+        // UI Güvenlik Bariyeri: riskLevel değeri .safeToDelete olmayan HİÇBİR klasör varsayılan olarak seçili başlatılamaz.
+        return resolvedResults.map { file in
+            if file.riskLevel != .safeToDelete && file.isSelectedForDeletion {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: file.riskLevel,
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: file.reasoningText,
+                    isSelectedForDeletion: false
+                )
+            }
+            return file
+        }
     }
 
     // MARK: - Adım 1: CFBundleIdentifier Çıkarımı
@@ -135,27 +208,33 @@ final class ScannerService {
         let userCachesDirectory = homeDir.appendingPathComponent("Library/Caches")
         let userContainersDirectory = homeDir.appendingPathComponent("Library/Containers")
         let userApplicationScriptsDirectory = homeDir.appendingPathComponent("Library/Application Scripts")
+        let userDiagnosticReportsDirectory = homeDir.appendingPathComponent("Library/Logs/DiagnosticReports")
+        let userCrashReporterDirectory = homeDir.appendingPathComponent("Library/Application Support/CrashReporter")
 
         let targetDirectories: [URL] = [
-            homeDir, // Kullanıcı Kök Dizini (~)
             homeDir.appendingPathComponent("Library/Application Support"),
             userCachesDirectory,
             homeDir.appendingPathComponent("Library/Preferences"),
             homeDir.appendingPathComponent("Library/Logs"),
+            userDiagnosticReportsDirectory,
+            userCrashReporterDirectory,
             userContainersDirectory,
             userApplicationScriptsDirectory,
             homeDir.appendingPathComponent("Library/Saved Application State"),
             homeDir.appendingPathComponent("Library/WebKit"),
             homeDir.appendingPathComponent("Library/HTTPStorages"),
-            URL(fileURLWithPath: "/Library/Application Support"),
-            URL(fileURLWithPath: "/Library/Caches"),
-            URL(fileURLWithPath: "/Library/Preferences"),
         ]
 
         var results: [URL] = []
 
         for directory in targetDirectories {
             guard fileManager.fileExists(atPath: directory.path) else { continue }
+
+            // DiagnosticReports ve CrashReporter dizinleri scanCrashAndLogDirectories() içinde .safeToDelete olarak doğrudan taranır
+            if directory.standardizedFileURL.path == userDiagnosticReportsDirectory.standardizedFileURL.path ||
+               directory.standardizedFileURL.path == userCrashReporterDirectory.standardizedFileURL.path {
+                continue
+            }
 
             let contents: [URL]
             do {
@@ -376,8 +455,8 @@ final class ScannerService {
     // MARK: - Adım 5: Darwin Dynamic Cache/Temp Taraması (/private/var/folders/)
 
     /// getconf DARWIN_USER_CACHE_DIR ve getconf DARWIN_USER_TEMP_DIR shell komutlarını çalıştırarak
-    /// /private/var/folders/.../C/ ve .../T/ dizinlerinde taranan uygulamanın Bundle ID'si ile tam eşleşen
-    /// klasörleri nokta atışı bulur. Sistemi kilitlememek için enumerator kullanılmaz.
+    /// /private/var/folders/.../C/ ve .../T/ dizinlerinin 1. seviye (shallow) içeriğini okur.
+    /// Hedef Bundle ID ile tam eşleşen veya onunla başlayan (.hasPrefix, örn: helper, renderer) klasörleri tespit eder.
     private func scanDarwinFolders(bundleID: String) async throws -> [ScannedFile] {
         let getconfURL = URL(fileURLWithPath: "/usr/bin/getconf")
 
@@ -397,31 +476,580 @@ final class ScannerService {
 
         var foundFiles: [ScannedFile] = []
         var checkedURLs = Set<URL>()
+        let lowerBundleID = bundleID.lowercased()
 
         for basePath in rawPaths {
             let baseDirURL = URL(fileURLWithPath: basePath)
-            let candidateURL = baseDirURL.appendingPathComponent(bundleID)
+            guard fileManager.fileExists(atPath: baseDirURL.path) else { continue }
 
-            guard !checkedURLs.contains(candidateURL) else { continue }
-            checkedURLs.insert(candidateURL)
+            // 1. Seviye (shallow) doğrudan içini oku; tüm sistemi kilitlememek için recursive enumerator kullanılmaz
+            guard let contents = try? fileManager.contentsOfDirectory(
+                at: baseDirURL,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) else { continue }
 
-            // Hiçbir koşulda enumerator ile baştan sona tarama yapılmaz;
-            // sadece getconf çıktısının sonuna Bundle ID eklenerek nokta atışı kontrol edilir.
-            if fileManager.fileExists(atPath: candidateURL.path) {
+            for itemURL in contents {
+                guard !checkedURLs.contains(itemURL) else { continue }
+                let itemName = itemURL.lastPathComponent
+                let lowerItemName = itemName.lowercased()
+
+                // Klasör adı hedefin Bundle ID'si ile başlıyor mu? (.hasPrefix)
+                guard itemName.hasPrefix(bundleID) || lowerItemName.hasPrefix(lowerBundleID) else {
+                    continue
+                }
+
+                checkedURLs.insert(itemURL)
+
+                // Tam eşleşme mi yoksa suffix (helper/renderer vb.) mi?
+                let isExactMatch = (itemName == bundleID || lowerItemName == lowerBundleID)
+                let risk: RiskLevel = isExactMatch ? .safeToDelete : .unknown
+                let isSelected: Bool = isExactMatch ? true : false
+                let reasoning: String = isExactMatch
+                    ? "Darwin dinamik önbellek klasörü (tam bundle ID eşleşmesi)"
+                    : "Darwin dinamik alt/yan süreç klasörü (suffix eşleşmesi: \(itemName))"
+
                 let file = ScannedFile(
                     id: UUID(),
-                    url: candidateURL,
-                    size: fileSize(at: candidateURL),
-                    fileType: .cache,
-                    riskLevel: .safeToDelete, // İsim doğrudan Bundle ID ile tam eşleştiği için safeToDelete
+                    url: itemURL,
+                    size: fileSize(at: itemURL),
+                    fileType: inferFileType(from: itemURL),
+                    riskLevel: risk,
                     relatedBundleID: bundleID,
-                    isSelectedForDeletion: true
+                    discoveryMethod: .standard,
+                    reasoningText: reasoning,
+                    isSelectedForDeletion: isSelected
                 )
                 foundFiles.append(file)
             }
         }
 
         return foundFiles
+    }
+
+    // MARK: - Adım 6: Crash & Logs Taraması (DiagnosticReports & CrashReporter)
+
+    /// ~/Library/Logs/DiagnosticReports/ ve ~/Library/Application Support/CrashReporter/ dizinlerinde
+    /// doğrudan 1. seviye tarama yapar. Dosya adlarında hedef uygulamanın adı (örn: steam) VEYA Bundle ID'si geçiyorsa
+    /// (.contains veya .hasPrefix ile), bu dosyaları [ScannedFile] listesine
+    /// riskLevel: .safeToDelete ve discoveryMethod: .standard olarak ekler.
+    private func scanCrashAndLogDirectories(appUrl: URL, bundleID: String) throws -> [ScannedFile] {
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+
+        let appName = appUrl.deletingPathExtension().lastPathComponent
+        let lowerAppName = appName.lowercased()
+        let appNameWithoutSpaces = appName.replacingOccurrences(of: " ", with: "").lowercased()
+        let lowerBundleID = bundleID.lowercased()
+
+        let appWords = lowerAppName
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 4 }
+
+        let crashDirectories: [URL] = [
+            homeDir.appendingPathComponent("Library/Logs/DiagnosticReports"),
+            homeDir.appendingPathComponent("Library/Application Support/CrashReporter")
+        ]
+
+        var foundFiles: [ScannedFile] = []
+        var checkedURLs = Set<URL>()
+
+        for directory in crashDirectories {
+            guard fileManager.fileExists(atPath: directory.path) else { continue }
+
+            let contents: [URL]
+            do {
+                contents = try fileManager.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil,
+                    options: []
+                )
+            } catch {
+                throw ScannerError.permissionDenied(directory, error)
+            }
+
+            for itemURL in contents {
+                guard !checkedURLs.contains(itemURL) else { continue }
+                let itemName = itemURL.lastPathComponent
+                let lowerItemName = itemName.lowercased()
+
+                // Dosya adlarında hedef uygulamanın adı (örn: steam) VEYA Bundle ID'si geçiyorsa (.contains veya .hasPrefix ile)
+                let matchesAppName = lowerItemName.hasPrefix(lowerAppName) ||
+                                     lowerItemName.contains(lowerAppName) ||
+                                     lowerItemName.hasPrefix(appNameWithoutSpaces) ||
+                                     lowerItemName.contains(appNameWithoutSpaces) ||
+                                     appWords.contains(where: { lowerItemName.contains($0) })
+
+                let matchesBundleID = lowerItemName.hasPrefix(lowerBundleID) ||
+                                      lowerItemName.contains(lowerBundleID)
+
+                if matchesAppName || matchesBundleID {
+                    checkedURLs.insert(itemURL)
+                    let file = ScannedFile(
+                        id: UUID(),
+                        url: itemURL,
+                        size: fileSize(at: itemURL),
+                        fileType: inferFileType(from: itemURL),
+                        riskLevel: .safeToDelete,
+                        relatedBundleID: bundleID,
+                        discoveryMethod: .standard,
+                        reasoningText: "Crash & Log raporu (\(directory.lastPathComponent))",
+                        isSelectedForDeletion: true
+                    )
+                    foundFiles.append(file)
+                }
+            }
+        }
+
+        return foundFiles
+    }
+
+    // MARK: - Gelişmiş Vektör 1: Team ID & Group Containers
+
+    /// codesign veya Info.plist üzerinden TeamIdentifier okur ve ~/Library/Group Containers/ altında
+    /// Team ID ile başlayan klasörleri .sharedDependency olarak ekler.
+    private func scanTeamIDGroupContainers(appUrl: URL, bundleID: String) async -> [ScannedFile] {
+        var foundFiles: [ScannedFile] = []
+        var teamID: String? = nil
+
+        // 1. codesign -dv --verbose=4 <appUrl>
+        do {
+            let output = try await runProcessCombined(
+                executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
+                arguments: ["-dv", "--verbose=4", appUrl.path]
+            )
+            for line in output.components(separatedBy: .newlines) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("TeamIdentifier=") {
+                    let id = String(trimmed.dropFirst("TeamIdentifier=".count)).trimmingCharacters(in: .whitespaces)
+                    if !id.isEmpty && id != "not set" {
+                        teamID = id
+                        break
+                    }
+                }
+            }
+        } catch {}
+
+        // Fallback: Info.plist
+        if teamID == nil {
+            let plistURL = appUrl.appendingPathComponent("Contents/Info.plist")
+            if let data = try? Data(contentsOf: plistURL),
+               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+                teamID = plist["TeamIdentifier"] as? String ?? plist["AppIdentifierPrefix"] as? String
+            }
+        }
+
+        guard let extractedTeamID = teamID, !extractedTeamID.isEmpty else {
+            return []
+        }
+
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let groupContainersURL = homeDir.appendingPathComponent("Library/Group Containers")
+        guard fileManager.fileExists(atPath: groupContainersURL.path) else { return [] }
+
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: groupContainersURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else {
+            return []
+        }
+
+        for itemURL in contents {
+            let folderName = itemURL.lastPathComponent
+            if folderName.hasPrefix(extractedTeamID) {
+                let file = ScannedFile(
+                    id: UUID(),
+                    url: itemURL,
+                    size: fileSize(at: itemURL),
+                    fileType: .container,
+                    riskLevel: .sharedDependency,
+                    relatedBundleID: bundleID,
+                    discoveryMethod: .teamID,
+                    reasoningText: "Team ID (\(extractedTeamID)) ile eşleşen Group Container",
+                    isSelectedForDeletion: false
+                )
+                foundFiles.append(file)
+            }
+        }
+
+        return foundFiles
+    }
+
+    // MARK: - Gelişmiş Vektör 2: BTM (Background Task Management)
+
+    /// `sfltool dumpbtm` komutunu çalıştırarak hedef Bundle ID ile ilişkili servis kayıtlarını çıkarır.
+    private func scanBTM(bundleID: String) async -> [ScannedFile] {
+        var foundFiles: [ScannedFile] = []
+        let output: String
+        do {
+            output = try await runProcessCombined(
+                executableURL: URL(fileURLWithPath: "/usr/bin/sfltool"),
+                arguments: ["dumpbtm"]
+            )
+        } catch {
+            return []
+        }
+
+        let lowerBundleID = bundleID.lowercased()
+        let lines = output.components(separatedBy: .newlines)
+        var currentBlock: [String] = []
+        var blocks: [[String]] = []
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#") && trimmed.contains(":") {
+                if !currentBlock.isEmpty {
+                    blocks.append(currentBlock)
+                    currentBlock = []
+                }
+            }
+            currentBlock.append(trimmed)
+        }
+        if !currentBlock.isEmpty {
+            blocks.append(currentBlock)
+        }
+
+        var candidatePaths = Set<String>()
+
+        for block in blocks {
+            let blockText = block.joined(separator: "\n").lowercased()
+            guard blockText.contains(lowerBundleID) else { continue }
+
+            for line in block {
+                if line.hasPrefix("URL:") {
+                    var pathValue = String(line.dropFirst("URL:".count)).trimmingCharacters(in: .whitespaces)
+                    if pathValue.hasPrefix("file://") {
+                        if let u = URL(string: pathValue) {
+                            pathValue = u.path
+                        }
+                    }
+                    if pathValue != "(null)" && !pathValue.isEmpty {
+                        candidatePaths.insert(pathValue)
+                    }
+                } else if line.hasPrefix("Executable Path:") {
+                    let pathValue = String(line.dropFirst("Executable Path:".count)).trimmingCharacters(in: .whitespaces)
+                    if pathValue != "(null)" && !pathValue.isEmpty {
+                        candidatePaths.insert(pathValue)
+                    }
+                }
+            }
+        }
+
+        for path in candidatePaths {
+            guard fileManager.fileExists(atPath: path) else { continue }
+            let url = URL(fileURLWithPath: path)
+            let file = ScannedFile(
+                id: UUID(),
+                url: url,
+                size: fileSize(at: url),
+                fileType: inferFileType(from: url),
+                riskLevel: .highRisk,
+                relatedBundleID: bundleID,
+                discoveryMethod: .btm,
+                reasoningText: "sfltool BTM arka plan servisi kaydı",
+                isSelectedForDeletion: false
+            )
+            foundFiles.append(file)
+        }
+
+        return foundFiles
+    }
+
+    // MARK: - Gelişmiş Vektör 3: System Extensions
+
+    /// `systemextensionsctl list` komutunu çalıştırarak sistem eklentilerini tespit eder.
+    private func scanSystemExtensions(bundleID: String) async -> [ScannedFile] {
+        var foundFiles: [ScannedFile] = []
+        let output: String
+        do {
+            output = try await runProcessCombined(
+                executableURL: URL(fileURLWithPath: "/usr/bin/systemextensionsctl"),
+                arguments: ["list"]
+            )
+        } catch {
+            return []
+        }
+
+        let lowerBundleID = bundleID.lowercased()
+        guard output.lowercased().contains(lowerBundleID) else { return [] }
+
+        let targetDirs = [
+            URL(fileURLWithPath: "/Library/SystemExtensions"),
+            URL(fileURLWithPath: "/Library/DriverExtensions"),
+            URL(fileURLWithPath: "/Library/Extensions")
+        ]
+
+        var checkedURLs = Set<URL>()
+
+        for dir in targetDirs {
+            guard fileManager.fileExists(atPath: dir.path),
+                  let contents = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: []) else {
+                continue
+            }
+
+            for item in contents {
+                let name = item.lastPathComponent.lowercased()
+                if name.contains(lowerBundleID) {
+                    if !checkedURLs.contains(item) {
+                        checkedURLs.insert(item)
+                        let file = ScannedFile(
+                            id: UUID(),
+                            url: item,
+                            size: fileSize(at: item),
+                            fileType: .unknown,
+                            riskLevel: .highRisk,
+                            relatedBundleID: bundleID,
+                            discoveryMethod: .extension,
+                            reasoningText: "systemextensionsctl ile eşleşen sistem eklentisi",
+                            isSelectedForDeletion: false
+                        )
+                        foundFiles.append(file)
+                    }
+                }
+            }
+        }
+
+        return foundFiles
+    }
+
+    // MARK: - Gelişmiş Vektör 4: Statik Heuristic Database
+
+    /// `heuristics.json` veritabanındaki statik kural eşleşmelerini kontrol eder.
+    /// Anahtar (Key) olarak Bundle ID yerine .app dosya adı (uzantısız, boşluklar tireye çevrilmiş, küçük harf) kullanılır.
+    /// Örn: "Google Chrome.app" -> "google-chrome"
+    private func scanHeuristics(appUrl: URL, bundleID: String) async -> [ScannedFile] {
+        let heuristicsDB = loadHeuristicsDatabase()
+
+        // 1. JSON Key Eşleştirmesi: Hedefin .app dosya adından anahtar türet (Örn: "Google Chrome.app" -> "google-chrome")
+        let appFileName = appUrl.deletingPathExtension().lastPathComponent
+        let tokenizedKey = appFileName.replacingOccurrences(of: " ", with: "-").lowercased()
+
+        guard let paths = heuristicsDB[tokenizedKey] ?? heuristicsDB.first(where: { $0.key.lowercased() == tokenizedKey })?.value else {
+            return []
+        }
+
+        // 2. Tilde Genişletmesi: (NSHomeDirectory() as NSString) ile mutlak fiziksel yola çevir
+        let homeDir = NSHomeDirectory()
+        var foundFiles: [ScannedFile] = []
+
+        for rawPath in paths {
+            let expandedPath: String
+            if rawPath.hasPrefix("~/") {
+                expandedPath = (homeDir as NSString).appendingPathComponent(String(rawPath.dropFirst(2)))
+            } else if rawPath == "~" {
+                expandedPath = homeDir
+            } else {
+                expandedPath = (rawPath as NSString).expandingTildeInPath
+            }
+
+            // Yalnızca tam fiziksel yolda dosya/klasör bulunursa listeye ekle
+            guard fileManager.fileExists(atPath: expandedPath) else { continue }
+            let url = URL(fileURLWithPath: expandedPath)
+
+            // 3. Tahribat Engeli ve UI Bariyeri: riskLevel: .unknown, discoveryMethod: .heuristic, isSelectedForDeletion: false
+            let file = ScannedFile(
+                id: UUID(),
+                url: url,
+                size: fileSize(at: url),
+                fileType: inferFileType(from: url),
+                riskLevel: .unknown,
+                relatedBundleID: bundleID,
+                discoveryMethod: .heuristic,
+                reasoningText: "heuristics.json kural tabanlı eşleşme (\(tokenizedKey))",
+                isSelectedForDeletion: false
+            )
+            foundFiles.append(file)
+        }
+
+        return foundFiles
+    }
+
+    private func loadHeuristicsDatabase() -> [String: [String]] {
+        let currentDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let sourceFileDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "heuristics", withExtension: "json"),
+            sourceFileDir.appendingPathComponent("heuristics.json"),
+            currentDir.appendingPathComponent("heuristics.json"),
+            currentDir.appendingPathComponent("my_little_mac/heuristics.json"),
+            currentDir.appendingPathComponent("my_little_mac/Resources/heuristics.json")
+        ]
+
+        for case let url? in candidates {
+            if let data = try? Data(contentsOf: url),
+               let dict = try? JSONDecoder().decode([String: [String]].self, from: data) {
+                return dict
+            }
+        }
+        return [:]
+    }
+
+    // MARK: - Gelişmiş Vektör 5: Heuristic Overrides (Spesifik Alt Klasörler)
+
+    /// `overrides.json` veritabanındaki Bundle ID bazlı statik kural eşleşmelerini kontrol eder.
+    /// Format: [String: [String]] (Key: Bundle ID, Value: Alt klasör yolları).
+    /// Keşfedilen dosyalar KESİNLİKLE .safeToDelete ve .heuristicOverride olarak işaretlenir.
+    private func scanOverrides(bundleID: String) async -> [ScannedFile] {
+        let overridesDB = loadOverridesDatabase()
+
+        // 1. JSON Key Eşleştirmesi: Bundle ID ile tam veya case-insensitive eşleşme ara
+        let lowerBundleID = bundleID.lowercased()
+        guard let paths = overridesDB[bundleID] ?? overridesDB.first(where: { $0.key.lowercased() == lowerBundleID })?.value else {
+            return []
+        }
+
+        // 2. Tilde Genişletmesi ve Fiziksel Varlık Kontrolü
+        let homeDir = NSHomeDirectory()
+        var foundFiles: [ScannedFile] = []
+
+        for rawPath in paths {
+            let expandedPath: String
+            if rawPath.hasPrefix("~/") {
+                expandedPath = (homeDir as NSString).appendingPathComponent(String(rawPath.dropFirst(2)))
+            } else if rawPath == "~" {
+                expandedPath = homeDir
+            } else {
+                expandedPath = (rawPath as NSString).expandingTildeInPath
+            }
+
+            // Yalnızca tam fiziksel yolda dosya/klasör bulunursa listeye ekle
+            guard fileManager.fileExists(atPath: expandedPath) else { continue }
+            let url = URL(fileURLWithPath: expandedPath)
+
+            // 3. Veri Protokolü: discoveryMethod: .heuristicOverride, riskLevel: .safeToDelete, isSelectedForDeletion: true
+            let file = ScannedFile(
+                id: UUID(),
+                url: url,
+                size: fileSize(at: url),
+                fileType: inferFileType(from: url),
+                riskLevel: .safeToDelete,
+                relatedBundleID: bundleID,
+                discoveryMethod: .heuristicOverride,
+                reasoningText: "overrides.json kural tabanlı spesifik alt klasör eşleşmesi (\(bundleID))",
+                isSelectedForDeletion: true
+            )
+            foundFiles.append(file)
+        }
+
+        return foundFiles
+    }
+
+    private func loadOverridesDatabase() -> [String: [String]] {
+        let currentDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let sourceFileDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "overrides", withExtension: "json"),
+            sourceFileDir.appendingPathComponent("overrides.json"),
+            currentDir.appendingPathComponent("overrides.json"),
+            currentDir.appendingPathComponent("my_little_mac/overrides.json"),
+            currentDir.appendingPathComponent("my_little_mac/Resources/overrides.json")
+        ]
+
+        for case let url? in candidates {
+            if let data = try? Data(contentsOf: url),
+               let dict = try? JSONDecoder().decode([String: [String]].self, from: data) {
+                return dict
+            }
+        }
+        return [:]
+    }
+
+    // MARK: - Adım 8: Parent-Child Klasör Çakışması & Override İzolasyonu (Deduplication)
+
+    /// Eğer listede bir "Üst Klasör" (Örn: ~/Library/Application Support/Steam) VE aynı zamanda bu klasörün
+    /// içindeki bir "Alt Klasör/Dosya" (Örn: ~/Library/Application Support/Steam/appcache) birlikte bulunuyorsa:
+    /// Üst klasörün riskLevel değerini KESİNLİKLE .highRisk (Kod: 2) olarak zorlar ve isSelectedForDeletion = false yapar.
+    /// Böylece güvenli alt klasörler silinmeye hazır (seçili) kalırken, kullanıcı verisi barındıran ana klasör kilitlenir.
+    private func resolveParentChildCollisions(in files: [ScannedFile], appUrl: URL) -> [ScannedFile] {
+        let standardizedPaths = files.map { $0.url.standardizedFileURL.path }
+        let standardizedAppPath = appUrl.standardizedFileURL.path
+
+        // .heuristicOverride ile gelen alt dosyaların standart yolları
+        let overrideChildPaths = files
+            .filter { $0.discoveryMethod == .heuristicOverride }
+            .map { $0.url.standardizedFileURL.path }
+
+        return files.map { file in
+            let parentPath = file.url.standardizedFileURL.path
+
+            // Ana .app paketinin kendisi doğrudan hedef uygulama olduğundan bu kuraldan muaf tutulur
+            if parentPath == standardizedAppPath || file.fileType == .appBundle {
+                return file
+            }
+
+            let parentPathWithSlash = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
+
+            // 1. Override İzolasyonu: overrides.json üzerinden .heuristicOverride ile bulunmuş
+            // spesifik alt dosyalar varsa, bu alt dosyaların ÜST KLASÖRÜNÜ KESİNLİKLE .highRisk yap
+            // ve isSelectedForDeletion = false olarak kilitle.
+            let hasOverrideChild = overrideChildPaths.contains { childPath in
+                childPath != parentPath && childPath.hasPrefix(parentPathWithSlash)
+            }
+
+            if hasOverrideChild {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: .highRisk, // KESİNLİKLE .highRisk (Kod: 2)
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: "Güvenli alt klasörler (.heuristicOverride) bağımsız hedeflendiğinden üst klasör kullanıcı verilerini korumak amacıyla yüksek riskli (.highRisk) olarak kilitlendi",
+                    isSelectedForDeletion: false // UI Güvenlik Bariyeri: KESİNLİKLE false
+                )
+            }
+
+            // 2. Genel parent-child çakışması (Deduplication):
+            let hasChildInList = standardizedPaths.contains { childPath in
+                childPath != parentPath && childPath.hasPrefix(parentPathWithSlash)
+            }
+
+            if hasChildInList {
+                return ScannedFile(
+                    id: file.id,
+                    url: file.url,
+                    size: file.size,
+                    fileType: file.fileType,
+                    riskLevel: .highRisk, // KESİNLİKLE .highRisk (Kod: 2)
+                    relatedBundleID: file.relatedBundleID,
+                    discoveryMethod: file.discoveryMethod,
+                    reasoningText: "Alt klasör/dosyaları bağımsız olarak listelendiğinden üst klasör yüksek riskli (.highRisk) olarak kilitlendi",
+                    isSelectedForDeletion: false // UI Güvenlik Bariyeri: KESİNLİKLE false
+                )
+            }
+
+            return file
+        }
+    }
+
+    // MARK: - Yardımcı: stdout + stderr Birleşik Process Çalıştırma
+
+    /// Komut çıktısını hem stdout hem stderr birleştirilmiş olarak asenkron döner.
+    private func runProcessCombined(executableURL: URL, arguments: [String]) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let output = String(data: data, encoding: .utf8) ?? ""
+                    continuation.resume(returning: output)
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     // MARK: - Yardımcı: Process Çalıştırma (async)
@@ -526,6 +1154,8 @@ final class ScannerService {
             return .cache
         } else if path.contains("/Preferences/") {
             return .preference
+        } else if path.contains("/Group Containers/") {
+            return .container
         } else if path.hasPrefix("/var/db/receipts/") {
             return .pkgReceipt
         } else if url.lastPathComponent.hasPrefix(".") {

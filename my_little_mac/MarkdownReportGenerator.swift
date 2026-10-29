@@ -78,6 +78,10 @@ struct MarkdownReportGenerator {
                 md += "- **Tam Fiziksel Yol:** `\(file.url.path)`\n"
                 md += "- **Boyut:** \(formatBytes(file.size)) (\(file.size) Bayt)\n"
                 md += "- **Dosya Türü:** \(file.fileType.rawValue)\n"
+                md += "- **Keşif Yöntemi:** \(file.discoveryMethod.rawValue)\n"
+                if let reasoning = file.reasoningText, !reasoning.isEmpty {
+                    md += "- **Analiz/Keşif Gerekçesi:** \(reasoning)\n"
+                }
                 md += "- **Risk Seviyesi:** \(riskTitle(file.riskLevel)) (Kod: \(file.riskLevel.rawValue))\n"
                 md += "- **Silme Seçim Durumu:** \(statusText)\n"
                 if let bundleID = file.relatedBundleID {
