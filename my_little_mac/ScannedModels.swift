@@ -24,7 +24,19 @@ enum FileType: String, Codable {
     case preference = "Preference"
     case pkgReceipt = "PKG Receipt File"
     case hiddenDotfile = "Hidden Dotfile"
+    case container = "Group Container"
     case unknown = "Unknown"
+}
+
+// MARK: - DiscoveryMethod
+
+enum DiscoveryMethod: String, Codable {
+    case standard
+    case teamID
+    case btm
+    case heuristic
+    case `extension`
+    case heuristicOverride
 }
 
 // MARK: - ScannedFile
@@ -36,7 +48,31 @@ struct ScannedFile: Identifiable, Equatable {
     let fileType: FileType
     let riskLevel: RiskLevel
     let relatedBundleID: String?
+    let discoveryMethod: DiscoveryMethod
+    let reasoningText: String?
     var isSelectedForDeletion: Bool
+
+    init(
+        id: UUID = UUID(),
+        url: URL,
+        size: Int64,
+        fileType: FileType,
+        riskLevel: RiskLevel,
+        relatedBundleID: String?,
+        discoveryMethod: DiscoveryMethod = .standard,
+        reasoningText: String? = nil,
+        isSelectedForDeletion: Bool
+    ) {
+        self.id = id
+        self.url = url
+        self.size = size
+        self.fileType = fileType
+        self.riskLevel = riskLevel
+        self.relatedBundleID = relatedBundleID
+        self.discoveryMethod = discoveryMethod
+        self.reasoningText = reasoningText
+        self.isSelectedForDeletion = isSelectedForDeletion
+    }
 }
 
 // MARK: - ScannedApp

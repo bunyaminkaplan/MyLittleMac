@@ -36,11 +36,26 @@ enum FileType: String, Codable {
     case preference = "Preference"
     case pkgReceipt = "PKG Receipt File"
     case hiddenDotfile = "Hidden Dotfile"
+    case container = "Group Container"
     case unknown = "Unknown"
 }
 ```
 
-### C. ScannedFile (Struct)
+### C. DiscoveryMethod (Enum)
+Dosyanın sistemde hangi keşif tekniği veya kural motoru tarafından bulunduğunu belirtir.
+
+```swift
+enum DiscoveryMethod: String, Codable {
+    case standard
+    case teamID
+    case btm
+    case heuristic
+    case `extension`
+    case heuristicOverride
+}
+```
+
+### D. ScannedFile (Struct)
 Bulunan her bir dosyanın veya klasörün temsilidir. Scanner ve Analyzer bu nesneyi üretir, UI sadece bu nesneyi okur.
 
 ```swift
@@ -51,11 +66,13 @@ struct ScannedFile: Identifiable, Equatable {
     let fileType: FileType
     let riskLevel: RiskLevel
     let relatedBundleID: String? // Dosyanın kime ait olduğunun CFBundleIdentifier kanıtı
+    let discoveryMethod: DiscoveryMethod // Dosyanın keşfedilme yöntemi
+    let reasoningText: String? // Analyzer veya Scanner tarafından üretilen risk/keşif gerekçesi
     var isSelectedForDeletion: Bool // UI ajanının kullanacağı seçim durumu. RiskLevel 1, 2 veya 3 ise bu değer ZORUNLU OLARAK false başlatılmalıdır.
 }
 ```
 
-### D. ScannedApp (Struct)
+### E. ScannedApp (Struct)
 Kaldırılmak üzere seçilen ana hedef uygulamayı temsil eder.
 
 ```swift
