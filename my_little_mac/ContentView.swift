@@ -20,9 +20,13 @@ final class ContentViewModel {
     var isAdvancedModeUnlocked: Bool = false
     var isScanning: Bool = false
     var scanError: String?
+    var isDeleting: Bool = false
+    var deletionError: String?
+    var deletionSuccessMessage: String?
 
     private let scannerService = ScannerService()
     private let analyzerService = AnalyzerService()
+    private let xpcConnectionManager = XPCConnectionManager()
 
     /// Sadece `isSelectedForDeletion == true` olan dosyaların toplam boyutu.
     var totalSelectedSize: Int64 {
@@ -47,9 +51,37 @@ final class ContentViewModel {
         scannedApp?.relatedFiles.filter { $0.isSelectedForDeletion } ?? []
     }
 
-    /// Silme talebi — şimdilik dummy fonksiyon. Fiziksel silme İÇERMEZ.
-    func requestDeletion(files: [ScannedFile]) {
-        // İçi şimdilik boş. Gelecekte silme ajanına iletilecek.
+    // MARK: - XPC IPC Köprü Metodu (UI & İletişim Bariyeri)
+
+    /// SADECE `isSelectedForDeletion == true` olan [ScannedFile] objelerinin mutlak fiziksel yollarını (`[String]`)
+    /// filtreleyip XPC servisine gönderen köprü metodu.
+    /// Kilitli (seçilmemiş) hiçbir dosya yolu KESİNLİKLE IPC üzerinden Helper'a iletilemez.
+    @MainActor
+    func requestDeletion(files: [ScannedFile]) async {
+        // İletişim Bariyeri: Yalnızca isSelectedForDeletion == true olanların mutlak path'lerini filtrele
+        let approvedPaths: [String] = files
+            .filter { $0.isSelectedForDeletion }
+            .map { $0.url.standardizedFileURL.path }
+
+        // Kilitli / seçilmemiş hiçbir dosya yolu iletilemez; liste boşsa durdur
+        guard !approvedPaths.isEmpty else {
+            return
+        }
+
+        isDeleting = true
+        deletionError = nil
+        deletionSuccessMessage = nil
+
+        do {
+            let success = try await xpcConnectionManager.verifyAndPrepareDeletion(paths: approvedPaths)
+            if success {
+                deletionSuccessMessage = "\(approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve hazırlandı (simülasyon)."
+            }
+        } catch {
+            deletionError = error.localizedDescription
+        }
+
+        isDeleting = false
     }
 
     // MARK: - Tarama Akışı
@@ -57,7 +89,7 @@ final class ContentViewModel {
     /// Seçilen .app URL'sinden ScannedApp oluşturur ve Scanner → Analyzer
     /// ardışık akışını async olarak başlatır.
     @MainActor
-    func startScan(appUrl: URL) async {
+    func startScan(appUrl: URL, isAdvancedModeEnabled: Bool = false) async {
         isScanning = true
         scanError = nil
         scannedApp = nil
@@ -76,8 +108,11 @@ final class ContentViewModel {
         )
 
         do {
-            // Adım 1: ScannerService ile tarama
-            let scannedFiles = try await scannerService.scan(appUrl: app.mainAppUrl)
+            // Adım 1: ScannerService ile tarama (isAdvancedModeEnabled parametresiyle)
+            let scannedFiles = try await scannerService.scan(
+                appUrl: app.mainAppUrl,
+                isAdvancedModeEnabled: isAdvancedModeEnabled
+            )
 
             // Adım 2: AnalyzerService ile risk analizi
             let analyzedFiles = try await analyzerService.analyze(files: scannedFiles, for: app)
@@ -112,6 +147,7 @@ final class ContentViewModel {
 
 struct ContentView: View {
     @State private var viewModel = ContentViewModel()
+    @AppStorage("isAdvancedModeEnabled") private var isAdvancedModeEnabled: Bool = false
     @State private var showSharedDependencyAlert = false
     @State private var sharedDependencyAlertFile: ScannedFile?
     @State private var isDropTargeted = false
@@ -154,6 +190,26 @@ struct ContentView: View {
         } message: {
             Text("Tarama raporu başarıyla kaydedildi:\n\(exportedFilePath)")
         }
+        .alert("XPC Doğrulama Başarılı", isPresented: Binding(
+            get: { viewModel.deletionSuccessMessage != nil },
+            set: { if !$0 { viewModel.deletionSuccessMessage = nil } }
+        )) {
+            Button("Tamam", role: .cancel) {}
+        } message: {
+            if let msg = viewModel.deletionSuccessMessage {
+                Text(msg)
+            }
+        }
+        .alert("XPC İletişim Hatası", isPresented: Binding(
+            get: { viewModel.deletionError != nil },
+            set: { if !$0 { viewModel.deletionError = nil } }
+        )) {
+            Button("Tamam", role: .cancel) {}
+        } message: {
+            if let err = viewModel.deletionError {
+                Text(err)
+            }
+        }
     }
 
     // MARK: - Header
@@ -181,6 +237,25 @@ struct ContentView: View {
                     Spacer()
 
                     HStack(spacing: 8) {
+                        // Gelişmiş Tarama Toggle
+                        Toggle(isOn: $isAdvancedModeEnabled) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles")
+                                    .foregroundStyle(.purple)
+                                Text("Gelişmiş Tarama")
+                                    .font(.caption)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .onChange(of: isAdvancedModeEnabled) { _, newValue in
+                            Task { @MainActor in
+                                await viewModel.startScan(
+                                    appUrl: app.mainAppUrl,
+                                    isAdvancedModeEnabled: newValue
+                                )
+                            }
+                        }
+
                         // Raporu Kaydet butonu (.md)
                         Button {
                             exportReportAsMarkdown()
@@ -254,6 +329,18 @@ struct ContentView: View {
             .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
                 handleDrop(providers: providers)
             }
+
+            // ── Gelişmiş Tarama Toggle ──
+            Toggle(isOn: $isAdvancedModeEnabled) {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.purple)
+                    Text("Gelişmiş Tarama (Team ID, BTM, Extensions)")
+                        .fontWeight(.medium)
+                }
+            }
+            .toggleStyle(.checkbox)
+            .padding(.top, 4)
         }
         .padding()
         .frame(maxWidth: .infinity)
@@ -321,14 +408,22 @@ struct ContentView: View {
             .toggleStyle(.checkbox)
 
             Button(action: {
-                viewModel.requestDeletion(files: viewModel.selectedFiles)
+                Task {
+                    await viewModel.requestDeletion(files: viewModel.selectedFiles)
+                }
             }) {
-                Label("Seçilenleri Temizle", systemImage: "trash")
-                    .frame(maxWidth: .infinity)
+                if viewModel.isDeleting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Label("Seçilenleri Temizle", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
-            .disabled(viewModel.selectedFiles.isEmpty)
+            .disabled(viewModel.selectedFiles.isEmpty || viewModel.isDeleting)
         }
         .padding()
     }
@@ -425,7 +520,10 @@ struct ContentView: View {
         if panel.runModal() == .OK, let selectedURL = panel.url {
             guard selectedURL.pathExtension == "app" else { return }
             Task {
-                await viewModel.startScan(appUrl: selectedURL)
+                await viewModel.startScan(
+                    appUrl: selectedURL,
+                    isAdvancedModeEnabled: isAdvancedModeEnabled
+                )
             }
         }
     }
@@ -437,7 +535,10 @@ struct ContentView: View {
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
             guard let url = url, url.pathExtension == "app" else { return }
             Task { @MainActor in
-                await viewModel.startScan(appUrl: url)
+                await viewModel.startScan(
+                    appUrl: url,
+                    isAdvancedModeEnabled: isAdvancedModeEnabled
+                )
             }
         }
         return true
@@ -474,6 +575,18 @@ struct FileRowView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
+                // Keşif yöntemi ve Analyzer gerekçesi (.caption, .secondary)
+                HStack(spacing: 4) {
+                    Text(discoveryMethodTitle(file.discoveryMethod))
+                    if let reasoning = file.reasoningText, !reasoning.isEmpty {
+                        Text("•")
+                        Text(reasoning)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
                 Text(formattedSize(file.size))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -492,6 +605,23 @@ struct FileRowView: View {
         }
         .padding(.vertical, 4)
         .opacity(isToggleDisabled ? 0.6 : 1.0)
+    }
+
+    private func discoveryMethodTitle(_ method: DiscoveryMethod) -> String {
+        switch method {
+        case .standard:
+            return "Keşif: Standart Tarama"
+        case .teamID:
+            return "Keşif: Team ID Paylaşımı"
+        case .btm:
+            return "Keşif: BTM (Background Task)"
+        case .extension:
+            return "Keşif: System Extension"
+        case .heuristic:
+            return "Keşif: Heuristic Kuralı"
+        case .heuristicOverride:
+            return "Keşif: Heuristic Override"
+        }
     }
 
     // MARK: - Risk İkonu
