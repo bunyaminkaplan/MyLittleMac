@@ -1,0 +1,19 @@
+{
+  "com.valvesoftware.steam": [
+    "~/Library/Application Support/Steam/appcache",
+    "~/Library/Application Support/Steam/depotcache",
+    "~/Library/Application Support/Steam/logs"
+  ],
+  "com.epicgames.EpicGamesLauncher": [
+    "~/Library/Application Support/Epic/EpicGamesLauncher/Saved/WebCache",
+    "~/Library/Application Support/Epic/EpicGamesLauncher/Saved/Logs"
+  ],
+  "com.docker.docker": [
+    "~/Library/Containers/com.docker.docker/Data/Library/Caches",
+    "~/Library/Containers/com.docker.docker/Data/log"
+  ],
+  "com.spotify.client": [
+    "~/Library/Application Support/Spotify/PersistentCache",
+    "~/Library/Application Support/Spotify/BrowserMetrics"
+  ]
+}
