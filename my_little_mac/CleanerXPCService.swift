@@ -2,10 +2,9 @@
 //  CleanerXPCService.swift
 //  my_little_mac
 //
-//  XPC Helper Agent: Privileged Helper Tool tarafında çalışacak XPC servisi.
-//  Gelen [URL] dizisini path traversal güvenlik duvarından geçirir,
-//  ardından DUMMY log basarak başarı döner.
-//  Fiziksel dosya silme kodu İÇERMEZ — kesinlikle YASAKLANMIŞTIR.
+//  XPC Privileged Helper Architecture: Privileged Helper Tool tarafında çalışan XPC servisi.
+//  Gelen [String] dosya yolu dizisini güvenlik denetiminden (Path Traversal & Whitelist) geçirir.
+//  Tahribat Engeli: Fiziksel silme kodu İÇERMEZ — sadece log basıp mock başarı döner.
 //
 
 import Foundation
@@ -14,29 +13,33 @@ import os.log
 // MARK: - XPC Güvenlik Hataları
 
 enum XPCSecurityError: LocalizedError {
-    case pathTraversalDetected(URL)
-    case emptyURLList
+    case pathTraversalDetected(String)
+    case emptyPathList
+    case unauthorizedPath(String)
+    case criticalSystemPathBlocked(String)
 
     var errorDescription: String? {
         switch self {
-        case .pathTraversalDetected(let url):
-            return "GÜVENLİK İHLALİ: Yasaklı dizine erişim talebi reddedildi → \(url.path)"
-        case .emptyURLList:
-            return "Boş URL listesi gönderildi."
+        case .pathTraversalDetected(let path):
+            return "GÜVENLİK İHLALİ: Dizin aşma (path traversal) girişimi tespit edildi → \(path)"
+        case .emptyPathList:
+            return "Boş dosya yolu listesi gönderildi."
+        case .unauthorizedPath(let path):
+            return "GÜVENLİK İHLALİ: İzin verilen dizin sınırları dışında kalan yol → \(path)"
+        case .criticalSystemPathBlocked(let path):
+            return "GÜVENLİK İHLALİ: Kritik sistem dizinine erişim talebi reddedildi → \(path)"
         }
     }
 }
 
-// MARK: - XPC Service (Privileged Helper Side)
+// MARK: - CleanerXPCService
 
-/// Privileged Helper Tool olarak çalışacak XPC servisi.
-/// `CleanerXPCProtocol`'ü implemente eder.
-final class CleanerXPCService: NSObject, CleanerXPCProtocol {
+/// Privileged Helper Tool olarak çalışan ve CleanerXPCProtocol'ü uygulayan servis.
+final class CleanerXPCService: NSObject, CleanerXPCProtocol, NSXPCListenerDelegate {
 
-    private let logger = Logger(subsystem: "com.mylittlemac.xpchelper", category: "CleanerXPCService")
+    private let logger = Logger(subsystem: "bunyamin.my-little-mac.helper", category: "CleanerXPCService")
 
     /// İzin verilen (whitelist) dizin önekleri.
-    /// Sadece bu dizinlerin altındaki yollar kabul edilir.
     private let allowedPrefixes: [String] = [
         "/Library/",
         "/Applications/",
@@ -45,8 +48,7 @@ final class CleanerXPCService: NSObject, CleanerXPCProtocol {
         "/private/var/folders/",
     ]
 
-    /// Kesinlikle yasaklı dizin önekleri.
-    /// Bu dizinlere yönelik talepler anında reddedilir.
+    /// Kesinlikle yasaklı sistem dizin önekleri (blocklist).
     private let blockedPrefixes: [String] = [
         "/System/",
         "/usr/bin/",
@@ -55,71 +57,100 @@ final class CleanerXPCService: NSObject, CleanerXPCProtocol {
         "/sbin/",
         "/private/var/db/",
         "/private/var/protected/",
+        "/etc/",
+        "/var/root/",
+        "/Volumes/",
     ]
 
-    // MARK: - CleanerXPCProtocol Uygulaması
+    // MARK: - CleanerXPCProtocol
 
-    /// DUMMY silme fonksiyonu. Fiziksel silme kodu İÇERMEZ.
-    /// Gelen URL'leri güvenlik duvarından geçirir, konsola loglar ve başarılı döner.
-    func removeFiles(at urls: [URL], withReply reply: @escaping (Bool, Error?) -> Void) {
-
-        // Boş liste kontrolü
-        guard !urls.isEmpty else {
-            logger.warning("⚠️ Boş URL listesi alındı, işlem iptal.")
-            reply(false, XPCSecurityError.emptyURLList)
+    /// Gelen mutlak dosya yollarını güvenlik duvarından geçirir, loglar ve mock başarı döner.
+    /// ⛔ Fiziksel dosya silme komutları IPC bağlantısının stabilitesi kanıtlanana kadar kapalıdır.
+    func verifyAndPrepareDeletion(paths: [String], withReply reply: @escaping (Bool, Error?) -> Void) {
+        // 1. Boş liste kontrolü
+        guard !paths.isEmpty else {
+            logger.warning("⚠️ Boş dosya yolu listesi alındı, işlem reddedildi.")
+            reply(false, XPCSecurityError.emptyPathList)
             return
         }
 
-        logger.info("📥 XPC talebi alındı: \(urls.count) dosya işlenecek.")
+        logger.info("📥 XPC talebi alındı: \(paths.count) dosya yolu doğrulanacak.")
 
-        // ── Path Traversal Güvenlik Duvarı ──
-        for url in urls {
+        // 2. Güvenlik ve Yol Doğrulaması (Path Traversal & Whitelist)
+        for rawPath in paths {
             do {
-                try validatePath(url)
+                try validatePath(rawPath)
             } catch {
-                logger.error("🛑 GÜVENLİK İHLALİ — talep reddedildi: \(url.path)")
+                logger.error("🛑 GÜVENLİK İHLALİ — talep reddedildi: \(rawPath, privacy: .public)")
                 reply(false, error)
                 return
             }
         }
 
-        // ── DUMMY: Silme Simülasyonu (Sadece Log) ──
-        for url in urls {
-            // ⛔ GERÇEK SİLME KODU BURAYA YAZILAMAZ ⛔
-            // try FileManager.default.removeItem(at:) → YASAK
-            logger.info("🗑️ [DUMMY] Silinecek dosya: \(url.path)")
+        // 3. Tahribat Engeli (Mutlak Kısıtlama: Yalnızca Log & Mock Reply)
+        // ⛔ GERÇEK SİLME KODU (rm -rf, removeItem(at:) vb.) KESİNLİKLE BURAYA YAZILMAZ ⛔
+        for path in paths {
+            logger.info("🗑️ [MOCK] Silinmesi doğrulanmış ve hazırlanan yol: \(path, privacy: .public)")
+            print("[CleanerXPCService] [MOCK] verifyAndPrepareDeletion: \(path)")
         }
 
-        logger.info("✅ [DUMMY] \(urls.count) dosya başarıyla işlendi (simülasyon).")
+        logger.info("✅ [MOCK] \(paths.count) dosya yolu başarıyla doğrulandı ve simüle edildi.")
         reply(true, nil)
     }
 
-    // MARK: - Path Traversal Güvenlik Duvarı
+    // MARK: - Güvenlik Duvarı
 
-    /// Gelen URL'nin izin verilen dizinlerden birinde olup olmadığını,
-    /// ve yasaklı sistem dizinlerine işaret edip etmediğini kontrol eder.
-    private func validatePath(_ url: URL) throws {
-        let path = url.standardizedFileURL.path
+    /// Yolun güvenli olup olmadığını, traversal içermediğini ve kritik sistem dizini olmadığını doğrular.
+    private func validatePath(_ rawPath: String) throws {
+        // Boş yol kontrolü
+        guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw XPCSecurityError.emptyPathList
+        }
 
-        // 1) Yasaklı dizin kontrolü (blocklist)
+        // Path Traversal kontrolü (".." karakterleri)
+        if rawPath.contains("..") {
+            throw XPCSecurityError.pathTraversalDetected(rawPath)
+        }
+
+        let standardized = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+
+        // Kök dizin silme koruması
+        if standardized == "/" || standardized == "/Users" || standardized == "/Library" || standardized == "/Applications" {
+            throw XPCSecurityError.criticalSystemPathBlocked(standardized)
+        }
+
+        // Yasaklı sistem dizinleri kontrolü (blocklist)
         for blocked in blockedPrefixes {
-            if path.hasPrefix(blocked) {
-                throw XPCSecurityError.pathTraversalDetected(url)
+            if standardized == blocked || standardized.hasPrefix(blocked) {
+                throw XPCSecurityError.criticalSystemPathBlocked(standardized)
             }
         }
 
-        // 2) Kullanıcı Library dizini kontrolü (~/ ile başlayanlar)
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+        // Kullanıcı Library dizini (~/Library/ -> /Users/<name>/Library/)
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         let userLibrary = homeDir + "/Library/"
-        if path.hasPrefix(userLibrary) {
-            // ~/Library/ altı → izinli
+        if standardized.hasPrefix(userLibrary) {
             return
         }
 
-        // 3) Whitelist kontrolü — izin verilen öneklerden birinde mi?
-        let isAllowed = allowedPrefixes.contains { path.hasPrefix($0) }
-        if !isAllowed {
-            throw XPCSecurityError.pathTraversalDetected(url)
+        // Kullanıcı ana dizini altındaki dotfiles veya app container'ları
+        if standardized.hasPrefix(homeDir + "/.") || standardized.hasPrefix(homeDir + "/Library") {
+            return
         }
+
+        // Genel Whitelist kontrolü
+        let isAllowed = allowedPrefixes.contains { standardized.hasPrefix($0) }
+        if !isAllowed {
+            throw XPCSecurityError.unauthorizedPath(standardized)
+        }
+    }
+
+    // MARK: - NSXPCListenerDelegate
+
+    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        newConnection.exportedInterface = NSXPCInterface(with: CleanerXPCProtocol.self)
+        newConnection.exportedObject = self
+        newConnection.resume()
+        return true
     }
 }

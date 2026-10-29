@@ -16,17 +16,18 @@ Sen bir Antigravity ajanısın. Görevin, uygulamanın standart kullanıcı yetk
 ## 2. XPC PROTOKOLÜ VE VERİ TİPİ ZORUNLULUĞU
 XPC katmanı (`NSXPCConnection`) Swift struct nesnelerini desteklemez. İletişim protokolünü (@objc protocol) inşa ederken şu kısıtlamalara uyacaksın:
 - XPC fonksiyonu parametre olarak `[ScannedFile]` KABUL EDEMEZ.
-- Parametre olarak kesinlikle `[URL]` (veya `[String]`) dizisi bekleyen bir `@objc protocol CleanerXPCProtocol` oluşturacaksın.
-- Örnek imza: `@objc func removeFiles(at urls: [URL], withReply reply: @escaping (Bool, Error?) -> Void)`
+- Parametre olarak kesinlikle `[String]` dizisi bekleyen bir `@objc protocol CleanerXPCProtocol` oluşturacaksın.
+- Zorunlu imza: `@objc func verifyAndPrepareDeletion(paths: [String], withReply reply: @escaping (Bool, Error?) -> Void)`
 
 ## 3. MODERN MACOS MİMARİSİ (SMAppService)
-- macOS 14+ hedefliyoruz. Eski `SMJobBless` kütüphanelerini, `Info.plist` içindeki `SMPrivilegedExecutables` anahtarlarını veya köhnemiş scriptleri kullanma.
-- Yetkilendirme ve daemon kurulumu için `SMAppService.daemon(plistName:)` altyapısını kullanan bir kurulum yöneticisi (Installer) sınıfı inşa et.
+- macOS 13+ hedefliyoruz. Eski `SMJobBless` kütüphanelerini, `Info.plist` içindeki `SMPrivilegedExecutables` anahtarlarını veya köhnemiş scriptleri KESİNLİKLE REDDET.
+- Yetkilendirme ve daemon kurulumu için `SMAppService.daemon(plistName:)` altyapısını kullanan bir kurulum yöneticisi (`XPCConnectionManager`) inşa et. Helper Bundle ID'si ana uygulama ID'si ile uyumlu (`bunyamin.my-little-mac.helper`) olmalıdır.
 - Servis ile ana uygulama arasındaki IPC (Inter-Process Communication) bağlantısını kuracak, bağlantı koptuğunda (invalidation/interruption) temizliği yapacak mekanizmaları kodla.
 
 ## 4. GÜVENLİK VE YOL DOĞRULAMASI (PATH TRAVERSAL KORUMASI)
-Gelen `[URL]` dizisindeki her bir yol için XPC servisi içinde ikincil bir güvenlik kontrolü (dummy log içinde) yap:
-- Gelen URL'nin `/System/` dizinine veya kullanıcı dışı kritik macOS boot dosyalarına işaret edip etmediğini kontrol eden bir güvenlik duvarı fonksiyonu yaz. İşaret ediyorsa XPC servisi `Error` dönerek işlemi reddetmelidir.
+Gelen `[String]` dizisindeki her bir yol için XPC servisi içinde ikincil bir güvenlik kontrolü (dummy log içinde) yap:
+- Gelen yolun `/System/` dizinine veya kullanıcı dışı kritik macOS boot dosyalarına işaret edip etmediğini kontrol eden bir güvenlik duvarı fonksiyonu yaz. İşaret ediyorsa XPC servisi `Error` dönerek işlemi reddetmelidir.
 - Sadece `/Library/`, `~/Library/`, `/Applications/` veya `/usr/local/` yollarına izin veren bir doğrulama katmanı (whitelist) ekle.
+- UI ve İletişim Bariyeri: Yalnızca `isSelectedForDeletion == true` olan dosyaların mutlak yolları Helper'a iletilebilir. Kilitli dosyalar IPC hattına sokulamaz.
 
 Görevin bu altyapıyı eksiksiz bir Swift kodu olarak üretmektir.

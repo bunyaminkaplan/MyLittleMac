@@ -2,9 +2,9 @@
 //  CleanerXPCProtocol.swift
 //  my_little_mac
 //
-//  XPC Helper Agent: Privileged Helper Tool ile ana uygulama arasındaki
-//  IPC iletişim protokolü. XPC katmanı Swift struct desteklemez,
-//  bu yüzden parametre olarak kesinlikle [URL] kullanılır.
+//  XPC Privileged Helper Architecture: Ana uygulama ile Privileged Helper Tool
+//  arasındaki IPC iletişim protokolü. Veri aktarımı [String] mutlak fiziksel dosya
+//  yolları üzerinden yapılır; Swift struct nesneleri ([ScannedFile]) desteklenmez.
 //  Fiziksel dosya silme kodu İÇERMEZ.
 //
 
@@ -12,14 +12,13 @@ import Foundation
 
 // MARK: - XPC Protokolü
 
-/// Ana uygulama ile Privileged Helper Tool arasındaki XPC iletişim sözleşmesi.
-/// XPC katmanı (`NSXPCConnection`) Swift struct nesnelerini desteklemez;
-/// `[ScannedFile]` KABUL EDİLEMEZ, parametre olarak `[URL]` kullanılır.
+/// Ana uygulama ile Privileged Helper Tool arasındaki IPC iletişim sözleşmesi.
 @objc protocol CleanerXPCProtocol {
 
-    /// Verilen URL dizisindeki dosyaları silme talebi.
+    /// Silinecek dosya yollarını ana uygulamadan Helper'a aktarır ve güvenlik kontrolünden geçirir.
     /// - Parameters:
-    ///   - urls: UI'dan gelen, silinmesi onaylanan dosya yollarının `[URL]` dizisi.
+    ///   - paths: UI tarafından filtrelenerek gelen (yalnızca isSelectedForDeletion == true)
+    ///            mutlak dosya yollarının `[String]` dizisi.
     ///   - reply: İşlem sonucu — `(başarılıMı, hata)`.
-    func removeFiles(at urls: [URL], withReply reply: @escaping (Bool, Error?) -> Void)
+    func verifyAndPrepareDeletion(paths: [String], withReply reply: @escaping (Bool, Error?) -> Void)
 }
