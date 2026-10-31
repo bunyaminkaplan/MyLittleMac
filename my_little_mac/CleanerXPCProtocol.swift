@@ -13,12 +13,15 @@ import Foundation
 // MARK: - XPC Protokolü
 
 /// Ana uygulama ile Privileged Helper Tool arasındaki IPC iletişim sözleşmesi.
-@objc protocol CleanerXPCProtocol {
+/// C tabanlı mesajlaşma ve Objective-C köprüsü senkronizasyonu için @objc(CleanerXPCProtocol) ile tanımlanmıştır.
+@objc(CleanerXPCProtocol)
+protocol CleanerXPCProtocol {
 
-    /// Silinecek dosya yollarını ana uygulamadan Helper'a aktarır ve güvenlik kontrolünden geçirir.
+    /// Silinecek dosya yollarını hedef uygulamanın bundleID bilgisiyle ana uygulamadan Helper'a aktarır ve güvenlik kontrolünden geçirir.
     /// - Parameters:
+    ///   - bundleID: Hedef uygulamanın CFBundleIdentifier değeri (Örn: "com.google.Chrome").
     ///   - paths: UI tarafından filtrelenerek gelen (yalnızca isSelectedForDeletion == true)
-    ///            mutlak dosya yollarının `[String]` dizisi.
+    ///            mutlak dosya yollarının `[String]` (NSArray<NSString *>) dizisi.
     ///   - reply: İşlem sonucu — `(başarılıMı, hata)`.
-    func verifyAndPrepareDeletion(paths: [String], withReply reply: @escaping (Bool, Error?) -> Void)
+    @objc func verifyAndPrepareDeletion(bundleID: String, paths: [String], withReply reply: @escaping (Bool, Error?) -> Void)
 }

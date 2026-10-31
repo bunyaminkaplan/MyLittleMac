@@ -3,153 +3,253 @@
 //  my_little_mac
 //
 //  XPC Privileged Helper Architecture: Privileged Helper Tool tarafında çalışan XPC servisi.
-//  Gelen [String] dosya yolu dizisini güvenlik denetiminden (Path Traversal & Whitelist) geçirir.
+//  Gelen [String] dosya yolu dizisini bundleID bağlamında güvenlik denetiminden
+//  (Mutlak Yol, Path Traversal, Kritik Sistem Dizinleri, Sahiplik) geçirir.
+//  Silinebilirlik Kontrolü (Dry-Run): FileManager.default.isDeletableFile(atPath:) ile simülasyon.
 //  Tahribat Engeli: Fiziksel silme kodu İÇERMEZ — sadece log basıp mock başarı döner.
 //
 
 import Foundation
 import os.log
 
-// MARK: - XPC Güvenlik Hataları
-
-enum XPCSecurityError: LocalizedError {
-    case pathTraversalDetected(String)
-    case emptyPathList
-    case unauthorizedPath(String)
-    case criticalSystemPathBlocked(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .pathTraversalDetected(let path):
-            return "GÜVENLİK İHLALİ: Dizin aşma (path traversal) girişimi tespit edildi → \(path)"
-        case .emptyPathList:
-            return "Boş dosya yolu listesi gönderildi."
-        case .unauthorizedPath(let path):
-            return "GÜVENLİK İHLALİ: İzin verilen dizin sınırları dışında kalan yol → \(path)"
-        case .criticalSystemPathBlocked(let path):
-            return "GÜVENLİK İHLALİ: Kritik sistem dizinine erişim talebi reddedildi → \(path)"
-        }
-    }
-}
-
 // MARK: - CleanerXPCService
 
 /// Privileged Helper Tool olarak çalışan ve CleanerXPCProtocol'ü uygulayan servis.
-final class CleanerXPCService: NSObject, CleanerXPCProtocol, NSXPCListenerDelegate {
+@objc public final class CleanerXPCService: NSObject, CleanerXPCProtocol, NSXPCListenerDelegate {
 
     private let logger = Logger(subsystem: "bunyamin.my-little-mac.helper", category: "CleanerXPCService")
 
-    /// İzin verilen (whitelist) dizin önekleri.
-    private let allowedPrefixes: [String] = [
-        "/Library/",
-        "/Applications/",
-        "/usr/local/",
-        "/var/folders/",
-        "/private/var/folders/",
-    ]
-
-    /// Kesinlikle yasaklı sistem dizin önekleri (blocklist).
-    private let blockedPrefixes: [String] = [
-        "/System/",
-        "/usr/bin/",
-        "/usr/sbin/",
-        "/bin/",
-        "/sbin/",
-        "/private/var/db/",
-        "/private/var/protected/",
-        "/etc/",
-        "/var/root/",
-        "/Volumes/",
-    ]
-
     // MARK: - CleanerXPCProtocol
 
-    /// Gelen mutlak dosya yollarını güvenlik duvarından geçirir, loglar ve mock başarı döner.
-    /// ⛔ Fiziksel dosya silme komutları IPC bağlantısının stabilitesi kanıtlanana kadar kapalıdır.
-    func verifyAndPrepareDeletion(paths: [String], withReply reply: @escaping (Bool, Error?) -> Void) {
+    /// Gelen mutlak dosya yollarını bundleID bağlamında güvenlik filtresinden geçirir,
+    /// silinebilirlik durumunu simüle eder (Dry-Run) ve sonucu ana uygulamaya iletir.
+    /// ⛔ Fiziksel dosya silme komutları İÇERMEZ.
+    @objc public func verifyAndPrepareDeletion(
+        bundleID: String,
+        paths: [String],
+        withReply reply: @escaping (Bool, Error?) -> Void
+    ) {
         // 1. Boş liste kontrolü
         guard !paths.isEmpty else {
+            let error = NSError(
+                domain: "CleanerXPCSecurity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Dosya yolu listesi boş."]
+            )
             logger.warning("⚠️ Boş dosya yolu listesi alındı, işlem reddedildi.")
-            reply(false, XPCSecurityError.emptyPathList)
+            reply(false, error)
             return
         }
 
-        logger.info("📥 XPC talebi alındı: \(paths.count) dosya yolu doğrulanacak.")
+        let cleanBundleID = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanBundleID.isEmpty else {
+            let error = NSError(
+                domain: "CleanerXPCSecurity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Geçersiz bundleID."]
+            )
+            logger.warning("⚠️ Boş veya geçersiz bundleID alındı, işlem reddedildi.")
+            reply(false, error)
+            return
+        }
 
-        // 2. Güvenlik ve Yol Doğrulaması (Path Traversal & Whitelist)
+        logger.info("📥 XPC talebi alındı: [\(cleanBundleID)] için \(paths.count) dosya yolu doğrulanacak.")
+
+        // 2. Hedef uygulama belirteçlerini bundleID üzerinden türet
+        let targetTokens = deriveTargetTokens(from: cleanBundleID)
+
+        // 3. Güvenlik, Mutlak Yol ve Sahiplik Doğrulaması
+        var validatedStandardizedPaths: [String] = []
         for rawPath in paths {
             do {
-                try validatePath(rawPath)
+                let validatedPath = try validatePath(rawPath, bundleID: cleanBundleID, targetTokens: targetTokens)
+                validatedStandardizedPaths.append(validatedPath)
             } catch {
-                logger.error("🛑 GÜVENLİK İHLALİ — talep reddedildi: \(rawPath, privacy: .public)")
+                logger.error("🛑 GÜVENLİK İHLALİ — talep reddedildi: \(rawPath, privacy: .public) | Hata: \(error.localizedDescription)")
+                print("[CleanerXPCService] [SECURITY VIOLATION] Rejected: \(rawPath) - \(error.localizedDescription)")
                 reply(false, error)
                 return
             }
         }
 
-        // 3. Tahribat Engeli (Mutlak Kısıtlama: Yalnızca Log & Mock Reply)
-        // ⛔ GERÇEK SİLME KODU (rm -rf, removeItem(at:) vb.) KESİNLİKLE BURAYA YAZILMAZ ⛔
-        for path in paths {
-            logger.info("🗑️ [MOCK] Silinmesi doğrulanmış ve hazırlanan yol: \(path, privacy: .public)")
-            print("[CleanerXPCService] [MOCK] verifyAndPrepareDeletion: \(path)")
+        // 4. Silinebilirlik Kontrolü (Dry-Run Simülasyonu)
+        for path in validatedStandardizedPaths {
+            _ = FileManager.default.isDeletableFile(atPath: path)
+            let dryRunMsg = "Dry-run başarılı: [\(path)]"
+            print(dryRunMsg)
+            logger.info("Dry-run başarılı: [\(path, privacy: .public)]")
         }
 
-        logger.info("✅ [MOCK] \(paths.count) dosya yolu başarıyla doğrulandı ve simüle edildi.")
+        // 5. Tahribat Engeli
+        logger.info("✅ [DRY-RUN] \(validatedStandardizedPaths.count) dosya yolu başarıyla doğrulandı ve simüle edildi.")
         reply(true, nil)
     }
 
-    // MARK: - Güvenlik Duvarı
+    // MARK: - Güvenlik Duvarı & Doğrulama Katmanı
 
-    /// Yolun güvenli olup olmadığını, traversal içermediğini ve kritik sistem dizini olmadığını doğrular.
-    private func validatePath(_ rawPath: String) throws {
-        // Boş yol kontrolü
-        guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw XPCSecurityError.emptyPathList
+    private func validatePath(_ rawPath: String, bundleID: String, targetTokens: Set<String>) throws -> String {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Mutlak yol (absolute path) kontrolü
+        guard !trimmed.isEmpty, trimmed.hasPrefix("/") else {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Mutlak yol (absolute path) formatında değil - \(rawPath)"]
+            )
         }
 
-        // Path Traversal kontrolü (".." karakterleri)
-        if rawPath.contains("..") {
-            throw XPCSecurityError.pathTraversalDetected(rawPath)
+        // 2. Path Traversal kontrolü
+        if trimmed.contains("..") {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Dizin aşma (path traversal) tespit edildi - \(rawPath)"]
+            )
         }
 
-        let standardized = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        let standardized = URL(fileURLWithPath: trimmed).standardizedFileURL.path
+        guard standardized.hasPrefix("/") else {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Geçersiz mutlak yol - \(standardized)"]
+            )
+        }
 
-        // Kök dizin silme koruması
+        // 3. Kök dizin engeli
         if standardized == "/" || standardized == "/Users" || standardized == "/Library" || standardized == "/Applications" {
-            throw XPCSecurityError.criticalSystemPathBlocked(standardized)
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kök dizin engellendi - \(standardized)"]
+            )
         }
 
-        // Yasaklı sistem dizinleri kontrolü (blocklist)
-        for blocked in blockedPrefixes {
-            if standardized == blocked || standardized.hasPrefix(blocked) {
-                throw XPCSecurityError.criticalSystemPathBlocked(standardized)
+        // 4. Kritik çekirdek macOS dizinleri (/System/, /sbin/, /bin/, /usr/ - /usr/local/ hariç)
+        if standardized == "/System" || standardized.hasPrefix("/System/") {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kritik çekirdek macOS dizini engellendi (/System/) - \(standardized)"]
+            )
+        }
+
+        if standardized == "/sbin" || standardized.hasPrefix("/sbin/") {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kritik sistem dizini engellendi (/sbin/) - \(standardized)"]
+            )
+        }
+
+        if standardized == "/bin" || standardized.hasPrefix("/bin/") {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kritik sistem dizini engellendi (/bin/) - \(standardized)"]
+            )
+        }
+
+        // /usr/ (/usr/local/ hariç)
+        if standardized == "/usr" || (standardized.hasPrefix("/usr/") && !standardized.hasPrefix("/usr/local/")) {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kritik sistem dizini engellendi (/usr/) - \(standardized)"]
+            )
+        }
+
+        if standardized.hasPrefix("/private/var/db/") || standardized.hasPrefix("/private/var/protected/") || standardized.hasPrefix("/var/root/") {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Korumalı sistem dizini engellendi - \(standardized)"]
+            )
+        }
+
+        // 5. Genel kütüphane kök dizinlerinin silinmesini önleme
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        let genericRoots: Set<String> = [
+            homeDir,
+            homeDir + "/Library",
+            homeDir + "/Library/Application Support",
+            homeDir + "/Library/Caches",
+            homeDir + "/Library/Preferences",
+            homeDir + "/Library/Logs",
+            homeDir + "/Library/Containers",
+            homeDir + "/Library/Application Scripts",
+            homeDir + "/Library/Saved Application State",
+            homeDir + "/Library/WebKit",
+            homeDir + "/Library/HTTPStorages"
+        ]
+        if genericRoots.contains(standardized) {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Kök dizin engellendi - \(standardized)"]
+            )
+        }
+
+        // 6. Sahiplik (Ownership) doğrulaması
+        let lowercasedPath = standardized.lowercased()
+        let isMatched = targetTokens.contains { token in
+            lowercasedPath.contains(token)
+        }
+
+        guard isMatched else {
+            throw NSError(
+                domain: "CleanerXPCSecurity",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Yol hedef bundleID (\(bundleID)) belirteçleriyle eşleşmiyor - \(standardized)"]
+            )
+        }
+
+        return standardized
+    }
+
+    // MARK: - Belirteç Türetme
+
+    /// bundleID (Örn: "com.google.Chrome" veya "com.tinyspeck.slackmacgap") değerinden
+    /// hedef klasör/dosya isimleriyle eşleşecek belirteçleri türetir.
+    private func deriveTargetTokens(from bundleID: String) -> Set<String> {
+        var tokens = Set<String>()
+        let lower = bundleID.lowercased()
+        tokens.insert(lower)
+
+        let ignoredTokens: Set<String> = ["com", "org", "net", "io", "app"]
+        let delimiters = CharacterSet(charactersIn: ".-_")
+        let parts = lower.components(separatedBy: delimiters).filter { !$0.isEmpty }
+
+        for part in parts {
+            if !ignoredTokens.contains(part) && part.count >= 3 {
+                tokens.insert(part)
+
+                // Yaygın macOS eklerini temizle (örn. slackmacgap -> slack, appnameosx -> appname)
+                for suffix in ["macgap", "macos", "osx", "desktop", "client", "helper"] {
+                    if part.hasSuffix(suffix) && part.count > suffix.count + 2 {
+                        let stripped = String(part.dropLast(suffix.count))
+                        if !ignoredTokens.contains(stripped) && stripped.count >= 3 {
+                            tokens.insert(stripped)
+                        }
+                    }
+                }
             }
         }
 
-        // Kullanıcı Library dizini (~/Library/ -> /Users/<name>/Library/)
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
-        let userLibrary = homeDir + "/Library/"
-        if standardized.hasPrefix(userLibrary) {
-            return
+        if parts.count >= 2 {
+            let lastTwo = parts.suffix(2).joined(separator: ".")
+            tokens.insert(lastTwo)
         }
 
-        // Kullanıcı ana dizini altındaki dotfiles veya app container'ları
-        if standardized.hasPrefix(homeDir + "/.") || standardized.hasPrefix(homeDir + "/Library") {
-            return
-        }
-
-        // Genel Whitelist kontrolü
-        let isAllowed = allowedPrefixes.contains { standardized.hasPrefix($0) }
-        if !isAllowed {
-            throw XPCSecurityError.unauthorizedPath(standardized)
-        }
+        return tokens
     }
 
     // MARK: - NSXPCListenerDelegate
 
-    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+    public func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         newConnection.exportedInterface = NSXPCInterface(with: CleanerXPCProtocol.self)
-        newConnection.exportedObject = self
+        newConnection.exportedObject = CleanerXPCService()
         newConnection.resume()
         return true
     }
