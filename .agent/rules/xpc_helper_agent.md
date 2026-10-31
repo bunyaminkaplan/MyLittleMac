@@ -24,10 +24,13 @@ XPC katmanı (`NSXPCConnection`) Swift struct nesnelerini desteklemez. İletişi
 - Yetkilendirme ve daemon kurulumu için `SMAppService.daemon(plistName:)` altyapısını kullanan bir kurulum yöneticisi (`XPCConnectionManager`) inşa et. Helper Bundle ID'si ana uygulama ID'si ile uyumlu (`bunyamin.my-little-mac.helper`) olmalıdır.
 - Servis ile ana uygulama arasındaki IPC (Inter-Process Communication) bağlantısını kuracak, bağlantı koptuğunda (invalidation/interruption) temizliği yapacak mekanizmaları kodla.
 
-## 4. GÜVENLİK VE YOL DOĞRULAMASI (PATH TRAVERSAL KORUMASI)
-Gelen `[String]` dizisindeki her bir yol için XPC servisi içinde ikincil bir güvenlik kontrolü (dummy log içinde) yap:
-- Gelen yolun `/System/` dizinine veya kullanıcı dışı kritik macOS boot dosyalarına işaret edip etmediğini kontrol eden bir güvenlik duvarı fonksiyonu yaz. İşaret ediyorsa XPC servisi `Error` dönerek işlemi reddetmelidir.
-- Sadece `/Library/`, `~/Library/`, `/Applications/` veya `/usr/local/` yollarına izin veren bir doğrulama katmanı (whitelist) ekle.
-- UI ve İletişim Bariyeri: Yalnızca `isSelectedForDeletion == true` olan dosyaların mutlak yolları Helper'a iletilebilir. Kilitli dosyalar IPC hattına sokulamaz.
+## 4. GÜVENLİK VE YOL DOĞRULAMASI (PAYLOAD VALIDATION & DRY-RUN)
+Gelen `[String]` dizisindeki her bir yol için XPC servisi içinde çok katmanlı bir güvenlik kontrolü yap:
+- **Mutlak Yol & Çekirdek Koruması:** Gelen yolun `absolute path` olduğunu doğrula (`/` ile başlamalı). `/System/`, `/usr/bin/`, `/sbin/`, `/usr/sbin/`, `/bin/` gibi kritik macOS çekirdek dizinlerini barındıran yolları anında `Error` ile reddet.
+- **Ortak Bağımlılık & Belirsiz Kök Koruması:** `/Group Containers/` gibi ortak kullanım şüphesi taşıyan veya alt öğesi belirtilmemiş çıplak kök sistem dizinlerini (`~/Library/Application Support` vb.) reddet.
+- **Sahiplik Doğrulaması (Prefix/Suffix):** Yolların yalnızca hedef uygulamanın kalıntıları olduğunu doğrulayacak String (Prefix/Suffix) kontrol katmanı uygula. Belirsiz veya başka uygulamalara ait yolları reddet.
+- **Silinebilirlik Kontrolü (Dry-Run):** Güvenlik filtresini geçen yollar için `FileManager.default.isDeletableFile(atPath:)` metodunu kullanarak silinebilirlik durumunu simüle et ve sonuçları macOS konsoluna (`os_log` ve `print`) yazdır.
+- **Tahribat Engeli:** Hiçbir koşulda `rm -rf`, `removeItem(at:)`, `trashItem` kullanma; yalnızca simülasyon sonucunu ana uygulamaya `(Bool, Error?)` ile döndür.
+- **UI ve İletişim Bariyeri:** Yalnızca `isSelectedForDeletion == true` olan dosyaların mutlak yolları Helper'a iletilebilir. Kilitli dosyalar IPC hattına sokulamaz.
 
 Görevin bu altyapıyı eksiksiz bir Swift kodu olarak üretmektir.
