@@ -8,6 +8,8 @@
 
 /* Begin PBXFileReference section */
 		60C5BE67307D613700D74175 /* my_little_mac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = my_little_mac.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000001 /* bunyamin.my-little-mac.helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = "bunyamin.my-little-mac.helper.plist"; path = "Helper/bunyamin.my-little-mac.helper.plist"; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000002 /* bunyamin.my-little-mac.helper */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; name = "bunyamin.my-little-mac.helper"; path = "Helper/bunyamin.my-little-mac.helper"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +33,7 @@
 			isa = PBXGroup;
 			children = (
 				60C5BE69307D613700D74175 /* my_little_mac */,
+				A10000000000000000000007 /* Helper */,
 				60C5BE68307D613700D74175 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -43,6 +46,15 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		A10000000000000000000007 /* Helper */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000001 /* bunyamin.my-little-mac.helper.plist */,
+				A10000000000000000000002 /* bunyamin.my-little-mac.helper */,
+			);
+			path = Helper;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -53,6 +65,7 @@
 				60C5BE63307D613700D74175 /* Sources */,
 				60C5BE64307D613700D74175 /* Frameworks */,
 				60C5BE65307D613700D74175 /* Resources */,
+				A10000000000000000000005 /* Run Script (Embed Helper and LaunchDaemon) */,
 			);
 			buildRules = (
 			);
@@ -106,6 +119,51 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		A10000000000000000000005 /* Run Script (Embed Helper and LaunchDaemon) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			name = "Run Script (Embed Helper and LaunchDaemon)";
+			shellPath = /bin/sh;
+			shellScript = (
+				"DAEMON_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons\"",
+				"mkdir -p \"${DAEMON_DIR}\"",
+				"",
+				"PLIST_PATH=\"${PROJECT_DIR}/Helper/bunyamin.my-little-mac.helper.plist\"",
+				"",
+				"if [ ! -f \"${PLIST_PATH}\" ]; then",
+				"    echo \"error: Plist kaynakta yok: ${PLIST_PATH}\"",
+				"    exit 1",
+				"fi",
+				"",
+				"cp \"${PLIST_PATH}\" \"${DAEMON_DIR}/\" || { echo \"error: Kopyalama basarisiz\"; exit 1; }",
+				"",
+				"MACOS_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/MacOS\"",
+				"mkdir -p \"${MACOS_DIR}\"",
+				"",
+				"HELPER_PATH=\"${PROJECT_DIR}/Helper/bunyamin.my-little-mac.helper\"",
+				"",
+				"if [ ! -f \"${HELPER_PATH}\" ]; then",
+				"    echo \"error: Helper binary kaynakta yok: ${HELPER_PATH}\"",
+				"    exit 1",
+				"fi",
+				"",
+				"cp \"${HELPER_PATH}\" \"${MACOS_DIR}/\" || { echo \"error: Helper kopyalama basarisiz\"; exit 1; }",
+				"",
+				"TARGET_HELPER=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS/bunyamin.my-little-mac.helper\"",
+				"",
+				"if [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ]; then",
+				"    codesign --force --options runtime --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$TARGET_HELPER\" || { echo \"error: Helper codesign basarisiz: $EXPANDED_CODE_SIGN_IDENTITY\"; exit 1; }",
+				"elif [ -n \"$CODE_SIGN_IDENTITY\" ]; then",
+				"    codesign --force --options runtime --sign \"$CODE_SIGN_IDENTITY\" \"$TARGET_HELPER\" || { echo \"error: Helper codesign basarisiz: $CODE_SIGN_IDENTITY\"; exit 1; }",
+				"else",
+				"    codesign --force --options runtime --sign - \"$TARGET_HELPER\" || { echo \"error: Helper codesign ad-hoc basarisiz\"; exit 1; }",
+				"fi",
+				"",
+			);
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		60C5BE63307D613700D74175 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -153,7 +211,7 @@
 				DEVELOPMENT_TEAM = ZHQRA26V5V;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -217,7 +275,7 @@
 				DEVELOPMENT_TEAM = ZHQRA26V5V;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -240,6 +298,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "my_little_mac/my_little_mac.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -271,6 +330,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "my_little_mac/my_little_mac.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
