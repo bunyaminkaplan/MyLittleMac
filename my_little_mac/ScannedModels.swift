@@ -32,6 +32,8 @@ enum FileType: String, Codable {
 
 enum DiscoveryMethod: String, Codable {
     case standard
+    case spotlight
+    case pkgutil
     case teamID
     case btm
     case heuristic
@@ -44,6 +46,7 @@ enum DiscoveryMethod: String, Codable {
 struct ScannedFile: Identifiable, Equatable {
     let id: UUID
     let url: URL
+    var path: String { url.standardizedFileURL.path }
     let size: Int64
     let fileType: FileType
     let riskLevel: RiskLevel

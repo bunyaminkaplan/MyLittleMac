@@ -13,6 +13,112 @@ final class ScannerService {
 
     private let fileManager = FileManager.default
 
+    /// pkgutil ve sistem taramalarında koruma altına alınacak genel macOS sistem kök dizinleri.
+    /// Bu dizinler veya bunların kökleri KESİNLİKLE bağımsız temizleme hedefi olarak listeye eklenemez.
+    private let genericSystemRoots: Set<String> = [
+        "/",
+        "/Applications",
+        "/Applications/Utilities",
+        "/Library",
+        "/Library/Application Support",
+        "/Library/Audio",
+        "/Library/Caches",
+        "/Library/ColorSync",
+        "/Library/CoreMediaIO",
+        "/Library/Documentation",
+        "/Library/Extensions",
+        "/Library/Fonts",
+        "/Library/Frameworks",
+        "/Library/Graphics",
+        "/Library/Internet Plug-Ins",
+        "/Library/Java",
+        "/Library/Keyboard Layouts",
+        "/Library/LaunchAgents",
+        "/Library/LaunchDaemons",
+        "/Library/Logs",
+        "/Library/Logs/DiagnosticReports",
+        "/Library/Messages",
+        "/Library/Modem Scripts",
+        "/Library/OpenDirectory",
+        "/Library/PDF Services",
+        "/Library/Preferences",
+        "/Library/PrivilegedHelperTools",
+        "/Library/QuickLook",
+        "/Library/Receipts",
+        "/Library/Ruby",
+        "/Library/Sandbox",
+        "/Library/Scripts",
+        "/Library/Security",
+        "/Library/Services",
+        "/Library/Spelling",
+        "/Library/Spotlight",
+        "/Library/SystemProfiler",
+        "/Library/Updates",
+        "/Library/User Pictures",
+        "/Library/Video",
+        "/Library/WebServer",
+        "/Library/Apple",
+        "/System",
+        "/System/Applications",
+        "/System/Library",
+        "/System/Volumes",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/usr/bin",
+        "/usr/include",
+        "/usr/lib",
+        "/usr/libexec",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/local/etc",
+        "/usr/local/include",
+        "/usr/local/lib",
+        "/usr/local/opt",
+        "/usr/local/sbin",
+        "/usr/local/share",
+        "/usr/sbin",
+        "/usr/share",
+        "/usr/standalone",
+        "/private",
+        "/private/etc",
+        "/private/tftpboot",
+        "/private/tmp",
+        "/private/var",
+        "/private/var/db",
+        "/private/var/folders",
+        "/private/var/log",
+        "/private/var/run",
+        "/private/var/tmp",
+        "/private/var/vm",
+        "/var",
+        "/tmp",
+        "/etc",
+        "/opt",
+        "/opt/homebrew",
+        "/Users",
+        "/Users/Shared",
+        NSHomeDirectory(),
+        NSHomeDirectory() + "/Applications",
+        NSHomeDirectory() + "/Desktop",
+        NSHomeDirectory() + "/Documents",
+        NSHomeDirectory() + "/Downloads",
+        NSHomeDirectory() + "/Library",
+        NSHomeDirectory() + "/Library/Application Scripts",
+        NSHomeDirectory() + "/Library/Application Support",
+        NSHomeDirectory() + "/Library/Autosave Information",
+        NSHomeDirectory() + "/Library/Caches",
+        NSHomeDirectory() + "/Library/Containers",
+        NSHomeDirectory() + "/Library/Group Containers",
+        NSHomeDirectory() + "/Library/HTTPStorages",
+        NSHomeDirectory() + "/Library/IdentityServices",
+        NSHomeDirectory() + "/Library/LaunchAgents",
+        NSHomeDirectory() + "/Library/Logs",
+        NSHomeDirectory() + "/Library/Preferences",
+        NSHomeDirectory() + "/Library/Saved Application State",
+        NSHomeDirectory() + "/Library/WebKit"
+    ]
+
     // MARK: - Public API
 
     /// Ana tarama fonksiyonu. scanner_agent.md protokolünün tek çıktısıdır.
@@ -38,20 +144,44 @@ final class ScannerService {
             isSelectedForDeletion: false
         )
 
-        // Bulunan benzersiz URL'leri toplamak için bir Set kullanıyoruz.
-        var discoveredURLs = Set<URL>()
-
         // Adım 2: Spotlight (mdfind) Katmanı
         let spotlightURLs = try await runMdfind(bundleID: bundleID)
-        discoveredURLs.formUnion(spotlightURLs)
+        let spotlightFiles: [ScannedFile] = spotlightURLs
+            .filter { $0.standardizedFileURL.path != appUrl.standardizedFileURL.path }
+            .map { url in
+                ScannedFile(
+                    id: UUID(),
+                    url: url,
+                    size: fileSize(at: url),
+                    fileType: inferFileType(from: url),
+                    riskLevel: .unknown,
+                    relatedBundleID: bundleID,
+                    discoveryMethod: .spotlight,
+                    reasoningText: "Spotlight (mdfind) CFBundleIdentifier araması",
+                    isSelectedForDeletion: false
+                )
+            }
 
         // Adım 3: Fallback FileManager Taraması
         let fallbackURLs = try scanFallbackDirectories(appUrl: appUrl, bundleID: bundleID)
-        discoveredURLs.formUnion(fallbackURLs)
+        let fallbackFiles: [ScannedFile] = fallbackURLs
+            .filter { $0.standardizedFileURL.path != appUrl.standardizedFileURL.path }
+            .map { url in
+                ScannedFile(
+                    id: UUID(),
+                    url: url,
+                    size: fileSize(at: url),
+                    fileType: inferFileType(from: url),
+                    riskLevel: .unknown,
+                    relatedBundleID: bundleID,
+                    discoveryMethod: .standard,
+                    reasoningText: "Standart dizin taraması",
+                    isSelectedForDeletion: false
+                )
+            }
 
-        // Adım 4: pkgutil Makbuz (Receipt) Taraması
-        let pkgURLs = try await runPkgutilSearch(bundleID: bundleID)
-        discoveredURLs.formUnion(pkgURLs)
+        // Adım 4: pkgutil Makbuz (Receipt) ve BOM Taraması
+        let pkgutilFiles = (try? await runPkgutilSearch(appUrl: appUrl, bundleID: bundleID)) ?? []
 
         // Adım 5: Darwin Dynamic Cache/Temp Taraması (/private/var/folders/)
         let darwinCacheFiles = try await scanDarwinFolders(bundleID: bundleID)
@@ -59,35 +189,59 @@ final class ScannerService {
         // Adım 6: Crash & Logs Taraması (DiagnosticReports & CrashReporter)
         let crashLogFiles = try scanCrashAndLogDirectories(appUrl: appUrl, bundleID: bundleID)
 
-        // Ana .app paketinin kendisini yan dosyalardan çıkar (en başa tekil olarak eklenecek)
-        discoveredURLs.remove(appUrl)
+        // Birleştirme ve tekilleştirme (Deduplication)
+        var allResults: [ScannedFile] = [mainAppScannedFile]
+        var pathMap: [String: Int] = [mainAppScannedFile.path: 0]
 
-        // Darwin cache dosyalarının URL'lerini de discoveredURLs'ten çıkar (mükerrer olmasın)
-        for darwinFile in darwinCacheFiles {
-            discoveredURLs.remove(darwinFile.url)
+        func mergeFiles(_ files: [ScannedFile]) {
+            for file in files {
+                let p = file.path
+                if p == mainAppScannedFile.path { continue }
+                if let idx = pathMap[p] {
+                    let existing = allResults[idx]
+                    // Öncelikli discoveryMethod seç: pkgutil veya spotlight standard'a göre daha spesifiktir
+                    let preferredMethod: DiscoveryMethod
+                    if file.discoveryMethod == .pkgutil || existing.discoveryMethod == .pkgutil {
+                        preferredMethod = .pkgutil
+                    } else if file.discoveryMethod == .spotlight || existing.discoveryMethod == .spotlight {
+                        preferredMethod = .spotlight
+                    } else {
+                        preferredMethod = existing.discoveryMethod
+                    }
+
+                    // Öncelikli risk seviyesi
+                    let preferredRisk: RiskLevel
+                    if existing.riskLevel == .safeToDelete || file.riskLevel == .safeToDelete {
+                        preferredRisk = .safeToDelete
+                    } else if existing.riskLevel == .highRisk || file.riskLevel == .highRisk {
+                        preferredRisk = .highRisk
+                    } else {
+                        preferredRisk = .unknown
+                    }
+
+                    allResults[idx] = ScannedFile(
+                        id: existing.id,
+                        url: existing.url,
+                        size: max(existing.size, file.size),
+                        fileType: existing.fileType != .unknown ? existing.fileType : file.fileType,
+                        riskLevel: preferredRisk,
+                        relatedBundleID: bundleID,
+                        discoveryMethod: preferredMethod,
+                        reasoningText: file.reasoningText ?? existing.reasoningText,
+                        isSelectedForDeletion: preferredRisk == .safeToDelete ? existing.isSelectedForDeletion : false
+                    )
+                } else {
+                    pathMap[p] = allResults.count
+                    allResults.append(file)
+                }
+            }
         }
 
-        // Crash & Log dosyalarının URL'lerini de discoveredURLs'ten çıkar (mükerrer olmasın ve .safeToDelete korunsun)
-        for crashFile in crashLogFiles {
-            discoveredURLs.remove(crashFile.url)
-        }
-
-        // Bulunan her URL için ScannedFile objesi oluştur (mdfind ve FileManager fallback standart aramaları -> .standard)
-        let scannedFiles = discoveredURLs.map { url in
-            ScannedFile(
-                id: UUID(),
-                url: url,
-                size: fileSize(at: url),
-                fileType: inferFileType(from: url),
-                riskLevel: .unknown,             // Doğrulama yapılamadığı için KESİNLİKLE .unknown
-                relatedBundleID: bundleID,
-                discoveryMethod: .standard,
-                reasoningText: nil,
-                isSelectedForDeletion: false      // .unknown risk → KESİNLİKLE false
-            )
-        }
-
-        var allResults = [mainAppScannedFile] + darwinCacheFiles + crashLogFiles + scannedFiles
+        mergeFiles(darwinCacheFiles)
+        mergeFiles(crashLogFiles)
+        mergeFiles(pkgutilFiles)
+        mergeFiles(spotlightFiles)
+        mergeFiles(fallbackFiles)
 
         // Adım 7: Gelişmiş Tarama Protokolleri (advanced_protocols.md)
         if isAdvancedModeEnabled {
@@ -106,21 +260,29 @@ final class ScannerService {
             )
 
             let advancedFiles = teamIDFiles + btmFiles + extensionFiles + heuristicFiles + overrideFiles
-
-            var existingIndexByPath: [String: Int] = [:]
-            for (index, file) in allResults.enumerated() {
-                existingIndexByPath[file.url.standardizedFileURL.path] = index
-            }
-
             for advFile in advancedFiles {
-                let path = advFile.url.standardizedFileURL.path
-                if let existingIndex = existingIndexByPath[path] {
+                let path = advFile.path
+                if let existingIndex = pathMap[path] {
                     // Eğer dosya heuristicOverride ile gelmişse, genel aramayı override et
                     if advFile.discoveryMethod == .heuristicOverride {
                         allResults[existingIndex] = advFile
+                    } else if advFile.riskLevel == .sharedDependency {
+                        // Heuristik analiz ile paylaşılan bağımlılık (.sharedDependency) olduğu kesinleştiyse güncelle
+                        let existing = allResults[existingIndex]
+                        allResults[existingIndex] = ScannedFile(
+                            id: existing.id,
+                            url: existing.url,
+                            size: existing.size,
+                            fileType: existing.fileType != .unknown ? existing.fileType : advFile.fileType,
+                            riskLevel: .sharedDependency,
+                            relatedBundleID: bundleID,
+                            discoveryMethod: .heuristic,
+                            reasoningText: advFile.reasoningText ?? existing.reasoningText,
+                            isSelectedForDeletion: false
+                        )
                     }
                 } else {
-                    existingIndexByPath[path] = allResults.count
+                    pathMap[path] = allResults.count
                     allResults.append(advFile)
                 }
             }
@@ -408,44 +570,136 @@ final class ScannerService {
                lowerVendorWithoutSpaces.contains(lowerNameWithoutSpaces)
     }
 
-    // MARK: - Adım 4: pkgutil Makbuz (Receipt) Taraması
+    // MARK: - Adım 4: pkgutil Makbuz (Receipt) ve BOM Taraması
 
-    /// `pkgutil --pkgs` çıktısında bundle ID ile eşleşen paketleri bulur,
-    /// ardından `pkgutil --files` ile her paketin dosyalarını listeler.
-    private func runPkgutilSearch(bundleID: String) async throws -> [URL] {
+    /// `pkgutil --pkgs` çıktısında hedef uygulamaya ait paketleri tespit eder.
+    /// Eşleşen paketler için `pkgutil --pkg-info` ile kurulum kökünü (volume & location) çözer
+    /// ve `pkgutil --files` ile paketin (BOM) sisteme dağıttığı tüm dosyaları tespit eder.
+    /// KESİNLİKLE genel sistem dizinlerini (genericSystemRoots) filtreler ve sadece gerçek dosyaları döner.
+    private func runPkgutilSearch(appUrl: URL, bundleID: String) async throws -> [ScannedFile] {
         // Tüm kayıtlı paketleri listele
-        let allPackagesOutput = try await runProcess(
-            executableURL: URL(fileURLWithPath: "/usr/sbin/pkgutil"),
-            arguments: ["--pkgs"]
-        )
+        let allPackagesOutput: String
+        do {
+            allPackagesOutput = try await runProcess(
+                executableURL: URL(fileURLWithPath: "/usr/sbin/pkgutil"),
+                arguments: ["--pkgs"]
+            )
+        } catch {
+            return []
+        }
 
         let allPackages = allPackagesOutput
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 
-        // Bundle ID ile eşleşen paketleri filtrele
-        let matchingPackages = allPackages.filter { $0.contains(bundleID) }
+        let lowerBundleID = bundleID.lowercased()
+        let appName = appUrl.deletingPathExtension().lastPathComponent
+        let lowerAppName = appName.lowercased()
+        let appNameWithoutSpaces = lowerAppName.replacingOccurrences(of: " ", with: "")
 
-        var results: [URL] = []
+        let segments = lowerBundleID.components(separatedBy: ".")
+        let vendor = (segments.count >= 2 && !["com", "org", "net", "io", "app", "co", "uk", "de"].contains(segments[0]))
+            ? segments[0]
+            : (segments.count >= 2 ? segments[1] : "")
+
+        let isAppleApp = lowerBundleID.hasPrefix("com.apple.")
+
+        // Bundle ID, uygulama adı veya üretici belirteçleriyle eşleşen paketleri filtrele
+        let matchingPackages = allPackages.filter { pkg in
+            let lowerPkg = pkg.lowercased()
+
+            // Apple uygulaması değilse generic Apple sistem paketlerini filtrele
+            if !isAppleApp && lowerPkg.hasPrefix("com.apple.") {
+                return false
+            }
+
+            // 1. Tam veya kısmi Bundle ID eşleşmesi
+            if lowerPkg == lowerBundleID || lowerPkg.contains(lowerBundleID) {
+                return true
+            }
+
+            // 2. Ters eşleşme (bundleID paketi içeriyorsa, örn: bundleID = com.company.app.helper, pkg = com.company.app)
+            if lowerBundleID.contains(lowerPkg) && lowerPkg.contains(".") {
+                return true
+            }
+
+            // 3. Vendor ve App ismi kombinasyonu (Örn: com.adobe.pkg.Photoshop)
+            if !vendor.isEmpty && vendor != "apple" && vendor.count >= 3 {
+                if lowerPkg.contains(vendor) && !appNameWithoutSpaces.isEmpty && appNameWithoutSpaces.count >= 3 && lowerPkg.contains(appNameWithoutSpaces) {
+                    return true
+                }
+            }
+
+            return false
+        }
+
+        var results: [ScannedFile] = []
+        var seenPaths = Set<String>()
 
         for package in matchingPackages {
-            let filesOutput = try await runProcess(
+            // pkg-info ile volume ve location tespiti
+            let pkgInfoOutput = (try? await runProcess(
+                executableURL: URL(fileURLWithPath: "/usr/sbin/pkgutil"),
+                arguments: ["--pkg-info", package]
+            )) ?? ""
+
+            var volume = "/"
+            var location = "/"
+            for line in pkgInfoOutput.components(separatedBy: .newlines) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("volume:") {
+                    let val = trimmed.dropFirst("volume:".count).trimmingCharacters(in: .whitespaces)
+                    if !val.isEmpty { volume = val }
+                } else if trimmed.hasPrefix("location:") {
+                    let val = trimmed.dropFirst("location:".count).trimmingCharacters(in: .whitespaces)
+                    if !val.isEmpty { location = val }
+                }
+            }
+
+            // pkgutil --files ile paketin BOM kayıtlarını çıkar
+            guard let filesOutput = try? await runProcess(
                 executableURL: URL(fileURLWithPath: "/usr/sbin/pkgutil"),
                 arguments: ["--files", package]
-            )
+            ) else { continue }
 
             let filePaths = filesOutput
                 .components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
 
+            var baseURL = URL(fileURLWithPath: volume)
+            if location != "/" && !location.isEmpty {
+                baseURL = baseURL.appendingPathComponent(location)
+            }
+
             for relativePath in filePaths {
-                // pkgutil göreceli yollar döner; kök dizine göre mutlak yol oluştur
-                let absoluteURL = URL(fileURLWithPath: "/\(relativePath)")
-                if fileManager.fileExists(atPath: absoluteURL.path) {
-                    results.append(absoluteURL)
-                }
+                let resolvedURL = baseURL.appendingPathComponent(relativePath).standardizedFileURL
+                let resolvedPath = resolvedURL.path
+
+                // 1. Genel sistem kök dizinlerini filtrele
+                if genericSystemRoots.contains(resolvedPath) { continue }
+                if resolvedURL.pathComponents.count <= 2 { continue } // "/", "/Library", "/usr" gibi kökleri engelle
+                if resolvedPath == appUrl.standardizedFileURL.path { continue }
+
+                // 2. Dosyanın fiziksel olarak varlığını teyit et
+                guard fileManager.fileExists(atPath: resolvedPath) else { continue }
+                guard !seenPaths.contains(resolvedPath) else { continue }
+                seenPaths.insert(resolvedPath)
+
+                let fileType = inferFileType(from: resolvedURL)
+                let scanned = ScannedFile(
+                    id: UUID(),
+                    url: resolvedURL,
+                    size: fileSize(at: resolvedURL),
+                    fileType: fileType,
+                    riskLevel: .unknown,
+                    relatedBundleID: bundleID,
+                    discoveryMethod: .pkgutil,
+                    reasoningText: "macOS PKG makbuz (receipt) veritabanı BOM analizi (Paket: \(package))",
+                    isSelectedForDeletion: false
+                )
+                results.append(scanned)
             }
         }
 
@@ -846,22 +1100,73 @@ final class ScannerService {
             guard fileManager.fileExists(atPath: expandedPath) else { continue }
             let url = URL(fileURLWithPath: expandedPath)
 
-            // 3. Tahribat Engeli ve UI Bariyeri: riskLevel: .unknown, discoveryMethod: .heuristic, isSelectedForDeletion: false
+            // 3. Heuristik Klasör Sınıflandırması:
+            // ~/.gradle, ~/.m2, ~/.npm veya paylaşılan SDK dizinleri gibi klasörler
+            // KESİNLİKLE .sharedDependency olarak atanmalıdır.
+            let isShared = isSharedHeuristicPath(expandedPath)
+            let riskLevel: RiskLevel = isShared ? .sharedDependency : .unknown
+            let reasoning = isShared
+                ? "Heuristik paylaşılan bağımlılık / SDK klasörü (Ortak kullanım: \(url.lastPathComponent))"
+                : "heuristics.json kural tabanlı eşleşme (\(tokenizedKey))"
+
             let file = ScannedFile(
                 id: UUID(),
                 url: url,
                 size: fileSize(at: url),
                 fileType: inferFileType(from: url),
-                riskLevel: .unknown,
+                riskLevel: riskLevel,
                 relatedBundleID: bundleID,
                 discoveryMethod: .heuristic,
-                reasoningText: "heuristics.json kural tabanlı eşleşme (\(tokenizedKey))",
+                reasoningText: reasoning,
                 isSelectedForDeletion: false
             )
             foundFiles.append(file)
         }
 
         return foundFiles
+    }
+
+    /// Verilen yolun paylaşılan bir dotfile (.gradle, .m2, .npm vb.) veya paylaşılan bir SDK dizini olup olmadığını kontrol eder.
+    private func isSharedHeuristicPath(_ path: String) -> Bool {
+        let homeDir = NSHomeDirectory()
+        let pathStandardized = (path as NSString).standardizingPath
+        let lastComponent = URL(fileURLWithPath: pathStandardized).lastPathComponent.lowercased()
+
+        let sharedDotNames: Set<String> = [
+            ".gradle", ".m2", ".npm", ".yarn", ".cocoapods", ".gem",
+            ".cargo", ".rustup", ".docker", ".android", ".config",
+            ".local", ".nvm", ".sdkman", ".pyenv", ".rbenv", ".ssh",
+            ".gnupg", ".composer", ".nuget", ".pnpm", ".pub-cache"
+        ]
+
+        if sharedDotNames.contains(lastComponent) {
+            return true
+        }
+
+        for dotName in sharedDotNames {
+            let fullDotPath = (homeDir as NSString).appendingPathComponent(dotName)
+            if pathStandardized == fullDotPath || pathStandardized.hasPrefix(fullDotPath + "/") {
+                return true
+            }
+        }
+
+        let lowerPath = pathStandardized.lowercased()
+        let sharedSDKSubstrings = [
+            "/android/sdk",
+            "/library/android",
+            "/java/javavirtualmachines",
+            "/developer/commandlinetools",
+            "/developer/coresimulator",
+            "/developer/shared"
+        ]
+
+        for sub in sharedSDKSubstrings {
+            if lowerPath.contains(sub) {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func loadHeuristicsDatabase() -> [String: [String]] {
@@ -1156,7 +1461,7 @@ final class ScannerService {
             return .preference
         } else if path.contains("/Group Containers/") {
             return .container
-        } else if path.hasPrefix("/var/db/receipts/") {
+        } else if path.hasPrefix("/var/db/receipts/") || path.hasSuffix(".bom") || path.hasSuffix(".pkg") {
             return .pkgReceipt
         } else if url.lastPathComponent.hasPrefix(".") {
             return .hiddenDotfile
