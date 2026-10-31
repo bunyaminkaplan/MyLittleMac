@@ -64,3 +64,7 @@ Icon?
 
 # Geçici Dosyalar ve Günlükler
 *.log
+
+# Privileged Helper Binary
+Helper/bunyamin.my-little-mac.helper
+
