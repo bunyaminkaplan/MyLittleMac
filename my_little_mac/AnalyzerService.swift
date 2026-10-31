@@ -18,14 +18,26 @@ final class AnalyzerService {
     private let sharedDotfilePaths: [String] = [
         "/.android",
         "/.gradle",
-        "/.config",
+        "/.m2",
         "/.npm",
         "/.yarn",
         "/.cocoapods",
         "/.gem",
+        "/.cargo",
+        "/.rustup",
         "/.docker",
+        "/.config",
+        "/.local",
+        "/.nvm",
+        "/.sdkman",
+        "/.pyenv",
+        "/.rbenv",
         "/.ssh",
         "/.gnupg",
+        "/.composer",
+        "/.nuget",
+        "/.pnpm",
+        "/.pub-cache"
     ]
 
     /// Root (yönetici) izni gerektiren yüksek riskli dizin önekleri.
@@ -38,6 +50,65 @@ final class AnalyzerService {
     private let launchServicePaths: [String] = [
         "/Library/LaunchDaemons",
         "/Library/LaunchAgents",
+    ]
+
+    /// Bilinen yazılım ailesi tanımları (Adobe, JetBrains, Microsoft, Google, Apple vb.).
+    private struct KnownSoftwareFamily {
+        let name: String
+        let bundleKeywords: [String]
+        let rootFolders: [String]
+        let sharedSubfolders: [String]
+    }
+
+    private let knownFamilies: [KnownSoftwareFamily] = [
+        KnownSoftwareFamily(
+            name: "Adobe",
+            bundleKeywords: ["adobe"],
+            rootFolders: ["Adobe"],
+            sharedSubfolders: ["Common", "CoreSync", "OOBE", "Caps", "AAMUpdater", "CEP", "Creative Cloud Libraries", "Adobe Desktop Common", "Adobe Application Support", "CameraRaw"]
+        ),
+        KnownSoftwareFamily(
+            name: "JetBrains",
+            bundleKeywords: ["jetbrains"],
+            rootFolders: ["JetBrains"],
+            sharedSubfolders: ["consentOptions", "marketplace", "Toolbox"]
+        ),
+        KnownSoftwareFamily(
+            name: "Microsoft",
+            bundleKeywords: ["microsoft"],
+            rootFolders: ["Microsoft"],
+            sharedSubfolders: ["MAU2.0", "AutoUpdate", "Office", "EdgeShared", "PlayReady", "Silverlight"]
+        ),
+        KnownSoftwareFamily(
+            name: "Google",
+            bundleKeywords: ["google"],
+            rootFolders: ["Google"],
+            sharedSubfolders: ["GoogleSoftwareUpdate", "Chrome Component Updates", "Google Software Update"]
+        ),
+        KnownSoftwareFamily(
+            name: "Apple",
+            bundleKeywords: ["apple"],
+            rootFolders: ["Apple"],
+            sharedSubfolders: ["Developer Tools", "MobileDevice", "CoreTelephony", "Apple Desktop"]
+        ),
+        KnownSoftwareFamily(
+            name: "Valve",
+            bundleKeywords: ["valvesoftware", "steam"],
+            rootFolders: ["Steam"],
+            sharedSubfolders: ["steamapps", "config"]
+        ),
+        KnownSoftwareFamily(
+            name: "Epic Games",
+            bundleKeywords: ["epicgames"],
+            rootFolders: ["Epic"],
+            sharedSubfolders: ["EpicGamesLauncher", "UnrealEngine"]
+        ),
+        KnownSoftwareFamily(
+            name: "Mozilla",
+            bundleKeywords: ["mozilla"],
+            rootFolders: ["Mozilla"],
+            sharedSubfolders: ["Extensions", "SystemExtensions"]
+        )
     ]
 
     // MARK: - Public API
@@ -55,10 +126,10 @@ final class AnalyzerService {
         var analyzedFiles: [ScannedFile] = []
 
         for file in files {
-            // UI Güvenlik Bariyeri: Gelişmiş aramadan dönen dosyaların discoveryMethod değeri .standard DEĞİLSE,
+            // UI Güvenlik Bariyeri: Gelişmiş aramadan dönen dosyaların discoveryMethod değeri .standard, .spotlight, .pkgutil veya .heuristic DEĞİLSE,
             // arayüzdeki seçim kutuları (Checkbox) KESİNLİKLE varsayılan olarak kapalı (isSelectedForDeletion = false) başlatılacaktır.
             // İSTİSNA: .heuristicOverride katmanı .safeToDelete olarak gelir ve silinmeye hazır (seçili) başlatılır.
-            if file.discoveryMethod != .standard {
+            if file.discoveryMethod != .standard && file.discoveryMethod != .spotlight && file.discoveryMethod != .pkgutil && file.discoveryMethod != .heuristic {
                 let isSelected: Bool
                 if file.discoveryMethod == .heuristicOverride && file.riskLevel == .safeToDelete {
                     isSelected = true
@@ -253,18 +324,29 @@ final class AnalyzerService {
             return (.highRisk, "Kök dizin / yönetici izni gerektiren korumalı sistem yolu")
         }
 
-        // ── Adım 2: Ortak Bağımlılıklar ve Dotfiles ──
+        // ── Adım 2: Ortak Bağımlılıklar, Yazılım Ailesi ve Dotfiles ──
         if isSharedDotfile(path: path) {
-            return (.highRisk, "Ortak paylaşılan dotfile gizli dizini")
+            return (.sharedDependency, "Ortak paylaşılan araç, paket yöneticisi dotfile veya SDK dizini")
+        }
+
+        let familyCheck = checkSharedSoftwareFamily(path: path, app: app, siblingBundleExists: siblingBundleExists)
+        if familyCheck.isShared {
+            return (.highRisk, familyCheck.reason)
         }
 
         if siblingBundleExists && isInSharedApplicationSupport(path: path, bundleID: app.bundleIdentifier) {
-            return (.sharedDependency, "Kardeş uygulamalarla paylaşılan Application Support dizini")
+            return (.highRisk, "Kardeş uygulamalarla paylaşılan Application Support dizini (yazılım ailesi koruması)")
         }
 
-        // ── Adım 4: Standart ve Güvenli Dosyalar ──
+        // ── Adım 4: Standart ve Güvenli Dosyalar (Tam Bundle ID Eşleşmesi) ──
         if isStandardOwnedFile(path: path, bundleID: app.bundleIdentifier) {
             return (.safeToDelete, "Standart kütüphane dizini, CFBundleIdentifier eşleşmesi tam")
+        }
+
+        // ── Adım 5: Uygulama Bileşeni ve Sürüm Dizinleri Doğrulaması (Application Support, Caches vb.) ──
+        let componentCheck = checkApplicationOwnedComponent(path: path, app: app)
+        if componentCheck.isOwned {
+            return (.safeToDelete, componentCheck.reason)
         }
 
         // Hiçbir kurala uymadıysa güvenli tarafta kal
@@ -335,15 +417,34 @@ final class AnalyzerService {
         return .highRisk
     }
 
-    // MARK: - Adım 2: Ortak Bağımlılıklar ve Dotfiles
+    // MARK: - Adım 2: Ortak Bağımlılıklar, Dotfiles ve Paylaşılan SDK'lar
 
-    /// Dosya yolunun bilinen çapraz-platform dotfile dizinlerinden birinde olup olmadığını kontrol eder.
+    /// Dosya yolunun bilinen paylaşılan araç, paket yöneticisi dotfile (.gradle, .m2, .npm vb.) veya SDK dizinlerinden birinde olup olmadığını kontrol eder.
     private func isSharedDotfile(path: String) -> Bool {
         let homeDir = fileManager.homeDirectoryForCurrentUser.path
+        let standardizedPath = (path as NSString).standardizingPath
 
+        // 1. Home dizini altındaki bilinen dotfile ve paket yöneticisi yolları
         for dotfilePath in sharedDotfilePaths {
-            let fullDotfilePath = homeDir + dotfilePath
-            if path.hasPrefix(fullDotfilePath) {
+            let fullDotfilePath = (homeDir as NSString).appendingPathComponent(String(dotfilePath.dropFirst()))
+            if standardizedPath == fullDotfilePath || standardizedPath.hasPrefix(fullDotfilePath + "/") {
+                return true
+            }
+        }
+
+        // 2. Paylaşılan SDK ve geliştirici ortamı dizinleri
+        let lowerPath = standardizedPath.lowercased()
+        let sharedSDKSubstrings = [
+            "/android/sdk",
+            "/library/android",
+            "/java/javavirtualmachines",
+            "/developer/commandlinetools",
+            "/developer/coresimulator",
+            "/developer/shared"
+        ]
+
+        for sdkSub in sharedSDKSubstrings {
+            if lowerPath.contains(sdkSub) {
                 return true
             }
         }
@@ -411,6 +512,127 @@ final class AnalyzerService {
         return false
     }
 
+    /// Hedef uygulamanın ait olduğu yazılım ailesi (Adobe, JetBrains, Microsoft, Google vb.),
+    /// üretici (Vendor) ortak kök dizinleri veya kararlı/beta sürüm varyantlarına ait paylaşılan
+    /// yapılandırma klasörlerini tespit eder.
+    /// Bu tip ortak dizinler KESİNLİKLE riskLevel: .highRisk olarak işaretlenir.
+    private func checkSharedSoftwareFamily(
+        path: String,
+        app: ScannedApp,
+        siblingBundleExists: Bool
+    ) -> (isShared: Bool, reason: String) {
+        let homeDir = fileManager.homeDirectoryForCurrentUser.path
+        let lowerBundleID = app.bundleIdentifier.lowercased()
+        let appName = app.name.lowercased()
+        let appNameWithoutSpaces = appName.replacingOccurrences(of: " ", with: "")
+
+        let baseSearchPrefixes = [
+            homeDir + "/Library/Application Support/",
+            "/Library/Application Support/",
+            homeDir + "/Library/Preferences/",
+            "/Library/Preferences/",
+            homeDir + "/Library/Caches/",
+            "/Library/Caches/",
+            homeDir + "/Library/Containers/",
+            homeDir + "/Library/Group Containers/"
+        ]
+
+        // 1. Bilinen Yazılım Aileleri (Adobe, JetBrains, Microsoft, Google vb.) Kontrolü
+        for family in knownFamilies {
+            let isAppInFamily = family.bundleKeywords.contains { kw in
+                lowerBundleID.contains(kw) || appName.contains(kw)
+            }
+            guard isAppInFamily else { continue }
+
+            for prefix in baseSearchPrefixes {
+                guard path.hasPrefix(prefix) else { continue }
+                let relative = String(path.dropFirst(prefix.count))
+                let components = relative.components(separatedBy: "/").filter { !$0.isEmpty }
+                guard !components.isEmpty else { continue }
+
+                let topFolder = components[0]
+                let isTopFolderFamilyRoot = family.rootFolders.contains { $0.lowercased() == topFolder.lowercased() }
+                guard isTopFolderFamilyRoot else { continue }
+
+                // Durum A: Doğrudan yazılım ailesi ortak kök dizini (Örn: ~/Library/Application Support/Adobe)
+                if components.count == 1 {
+                    return (true, "\(family.name) yazılım ailesi ortak kök dizini (Suite root: \(topFolder))")
+                }
+
+                // Durum B: Bilinen paylaşılan alt servis/araç klasörü (Örn: Adobe/Common, Microsoft/MAU2.0)
+                let subFolder = components[1]
+                let isKnownSharedSub = family.sharedSubfolders.contains { $0.lowercased() == subFolder.lowercased() }
+                if isKnownSharedSub {
+                    return (true, "\(family.name) yazılım ailesi paylaşılan bileşen dizini (\(topFolder)/\(subFolder))")
+                }
+
+                // Durum C: Sibling bundle varsa veya alt klasör spesifik olarak bu uygulamanın adını içermiyorsa
+                let subLower = subFolder.lowercased()
+                let containsAppName = (!appNameWithoutSpaces.isEmpty && subLower.contains(appNameWithoutSpaces)) ||
+                                      (!appName.isEmpty && subLower.contains(appName)) ||
+                                      subLower.contains(lowerBundleID)
+
+                if siblingBundleExists && !containsAppName {
+                    return (true, "\(family.name) yazılım ailesi kardeş uygulamalarla paylaşılan yapılandırma klasörü (\(topFolder)/\(subFolder))")
+                }
+            }
+        }
+
+        // 2. Dinamik Üretici (Vendor) Kök Dizini ve Kardeş Uygulama (Sibling) Koruması
+        let segments = lowerBundleID.components(separatedBy: ".")
+        let vendor = (segments.count >= 2 && !["com", "org", "net", "io", "app", "co", "uk", "de"].contains(segments[0]))
+            ? segments[0]
+            : (segments.count >= 2 ? segments[1] : "")
+
+        if !vendor.isEmpty && vendor != "apple" && vendor.count >= 3 {
+            for prefix in baseSearchPrefixes {
+                guard path.hasPrefix(prefix) else { continue }
+                let relative = String(path.dropFirst(prefix.count))
+                let components = relative.components(separatedBy: "/").filter { !$0.isEmpty }
+                guard !components.isEmpty else { continue }
+
+                let topFolder = components[0]
+                let topLower = topFolder.lowercased().replacingOccurrences(of: " ", with: "")
+
+                // Eğer üst klasör doğrudan vendor adıysa (Örn: /Library/Application Support/Company)
+                if topLower == vendor.lowercased() {
+                    if components.count == 1 {
+                        return (true, "Yazılım ailesi/üretici ortak kök dizini (\(topFolder))")
+                    }
+
+                    if siblingBundleExists {
+                        let subFolder = components[1]
+                        let subLower = subFolder.lowercased().replacingOccurrences(of: " ", with: "")
+                        let containsApp = (!appNameWithoutSpaces.isEmpty && subLower.contains(appNameWithoutSpaces)) ||
+                                          subLower.contains(lowerBundleID)
+                        if !containsApp {
+                            return (true, "Kardeş uygulamalarla paylaşılan üretici yapılandırma klasörü (\(topFolder)/\(subFolder))")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Sürüm / Varyant Koruması (Stable / Beta / Canary / Dev / Preview)
+        let editionKeywords = ["beta", "canary", "dev", "preview", "insider", "nightly"]
+        let appIsEdition = editionKeywords.contains { lowerBundleID.contains($0) || appName.contains($0) }
+
+        if siblingBundleExists && appIsEdition {
+            // Eğer taranan uygulama bir Beta/Dev varyantıysa, kararlı sürüme (stable) ait klasörleri silmeyi engelle
+            for prefix in baseSearchPrefixes {
+                guard path.hasPrefix(prefix) else { continue }
+                let relative = String(path.dropFirst(prefix.count))
+                let relativeLower = relative.lowercased()
+                let pathHasEditionKeyword = editionKeywords.contains { relativeLower.contains($0) }
+                if !pathHasEditionKeyword {
+                    return (true, "Kararlı (Stable) ana sürüm ile paylaşılan veya ona ait yapılandırma klasörü")
+                }
+            }
+        }
+
+        return (false, "")
+    }
+
     // MARK: - Adım 3: PKG ve System Root Dosyaları
 
     /// Dosyanın root izni gerektiren korumalı bir dizinde olup olmadığını kontrol eder.
@@ -452,5 +674,109 @@ final class AnalyzerService {
         }
 
         return false
+    }
+
+    // MARK: - Adım 5: Uygulama Bileşeni ve Sürüm Dizinleri Doğrulaması
+
+    /// Application Support, Caches, Preferences vb. altındaki yolların doğrudan hedef uygulamaya ait
+    /// bir sürüm dizini (Örn: Google/AndroidStudio2025.2.2 veya JetBrains/IntelliJIdea2024.1) olup olmadığını doğrular.
+    /// Paket veya klasör adında sürüm numarası içeriyorsa ve doğrudan uygulamanın bir bileşeniyse safeToDelete döner.
+    private func checkApplicationOwnedComponent(
+        path: String,
+        app: ScannedApp
+    ) -> (isOwned: Bool, reason: String) {
+        let homeDir = fileManager.homeDirectoryForCurrentUser.path
+
+        let targetPrefixes = [
+            homeDir + "/Library/Application Support/",
+            "/Library/Application Support/",
+            homeDir + "/Library/Caches/",
+            "/Library/Caches/",
+            homeDir + "/Library/Preferences/",
+            "/Library/Preferences/",
+            homeDir + "/Library/Logs/",
+            "/Library/Logs/",
+            homeDir + "/Library/Saved Application State/",
+            homeDir + "/Library/WebKit/",
+            homeDir + "/Library/HTTPStorages/"
+        ]
+
+        let lowerBundleID = app.bundleIdentifier.lowercased()
+        let appName = app.name.lowercased()
+        let appNameWithoutSpaces = appName.replacingOccurrences(of: " ", with: "")
+
+        let bundleSegments = lowerBundleID.components(separatedBy: ".").filter { !$0.isEmpty }
+        let vendor = (bundleSegments.count >= 2 && !["com", "org", "net", "io", "app", "co", "uk", "de"].contains(bundleSegments[0]))
+            ? bundleSegments[0]
+            : (bundleSegments.count >= 2 ? bundleSegments[1] : "")
+
+        // Anlamlı uygulama belirteçleri (Örn: com.google.android.studio -> ["android", "studio"])
+        let appTokens: [String] = {
+            if bundleSegments.count >= 3 {
+                return Array(bundleSegments.dropFirst(2))
+            } else if bundleSegments.count == 2 {
+                return [bundleSegments[1]]
+            }
+            return [lowerBundleID]
+        }()
+        let combinedBundleAppToken = appTokens.joined()
+
+        for prefix in targetPrefixes {
+            guard path.hasPrefix(prefix) else { continue }
+            let relative = String(path.dropFirst(prefix.count))
+            let components = relative.components(separatedBy: "/").filter { !$0.isEmpty }
+            guard !components.isEmpty else { continue }
+
+            // Durum 1: Vendor/AppNameVersion (Örn: Google/AndroidStudio2025.2.2 veya JetBrains/IntelliJIdea2024.1)
+            if components.count >= 2 {
+                let vendorFolder = components[0].lowercased().replacingOccurrences(of: " ", with: "")
+                let candidateFolder = components[1]
+                let lowerCandidate = candidateFolder.lowercased()
+                let candidateWithoutSpaces = lowerCandidate.replacingOccurrences(of: " ", with: "")
+
+                // Vendor eşleşmesi (Google, JetBrains, Adobe vb.)
+                let matchesVendor = (!vendor.isEmpty && (vendorFolder == vendor || vendorFolder.contains(vendor) || vendor.contains(vendorFolder))) ||
+                                    lowerBundleID.contains(vendorFolder)
+
+                if matchesVendor {
+                    // Aday klasörün uygulamanın adı veya Bundle ID belirteçleriyle eşleşmesi
+                    let matchesAppToken = (!appNameWithoutSpaces.isEmpty && candidateWithoutSpaces.hasPrefix(appNameWithoutSpaces)) ||
+                                          (!appName.isEmpty && lowerCandidate.hasPrefix(appName)) ||
+                                          candidateWithoutSpaces.hasPrefix(combinedBundleAppToken) ||
+                                          (appTokens.count >= 2 && appTokens.allSatisfy { lowerCandidate.contains($0) })
+
+                    if matchesAppToken {
+                        // Sürüm numarası veya alt sürüm kalıbı kontrolü (Örn: 2025.2.2, 2024.1, 4.0, v2 vb.)
+                        let hasVersionPattern = candidateFolder.range(of: #"\d+(\.\d+)*"#, options: .regularExpression) != nil
+                        let reason = hasVersionPattern
+                            ? "Uygulama sürüm bileşeni dizini doğrulandı (\(components[0])/\(candidateFolder))"
+                            : "Uygulama alt bileşen dizini doğrulandı (\(components[0])/\(candidateFolder))"
+                        return (true, reason)
+                    }
+                }
+            }
+
+            // Durum 2: Doğrudan Application Support altında AppNameVersion (Örn: AndroidStudio2025.2.2 veya Sublime Text 3)
+            if components.count >= 1 {
+                let candidateFolder = components[0]
+                let lowerCandidate = candidateFolder.lowercased()
+                let candidateWithoutSpaces = lowerCandidate.replacingOccurrences(of: " ", with: "")
+
+                let matchesAppToken = (!appNameWithoutSpaces.isEmpty && candidateWithoutSpaces.hasPrefix(appNameWithoutSpaces)) ||
+                                      (!appName.isEmpty && lowerCandidate.hasPrefix(appName)) ||
+                                      candidateWithoutSpaces.hasPrefix(combinedBundleAppToken) ||
+                                      (appTokens.count >= 2 && appTokens.allSatisfy { lowerCandidate.contains($0) })
+
+                if matchesAppToken {
+                    let hasVersionPattern = candidateFolder.range(of: #"\d+(\.\d+)*"#, options: .regularExpression) != nil
+                    let reason = hasVersionPattern
+                        ? "Uygulama sürüm bileşeni dizini doğrulandı (\(candidateFolder))"
+                        : "Uygulama bileşen dizini doğrulandı (\(candidateFolder))"
+                    return (true, reason)
+                }
+            }
+        }
+
+        return (false, "")
     }
 }
