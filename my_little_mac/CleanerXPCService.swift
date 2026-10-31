@@ -10,6 +10,8 @@
 //
 
 import Foundation
+import ServiceManagement
+import Darwin
 import os.log
 
 // MARK: - CleanerXPCService
@@ -72,7 +74,14 @@ import os.log
             }
         }
 
-        // 4. Silinebilirlik Kontrolü (Dry-Run Simülasyonu)
+        // 4. Servis Boşaltma (Daemon/Agent Unloading) — KESİNLİKLE dry-run simülasyonundan ÖNCE
+        for path in validatedStandardizedPaths {
+            if path.hasSuffix(".plist") && (path.contains("/LaunchDaemons/") || path.contains("/LaunchAgents/")) {
+                unloadLaunchService(atPath: path)
+            }
+        }
+
+        // 5. Silinebilirlik Kontrolü (Dry-Run Simülasyonu)
         for path in validatedStandardizedPaths {
             _ = FileManager.default.isDeletableFile(atPath: path)
             let dryRunMsg = "Dry-run başarılı: [\(path)]"
@@ -80,7 +89,7 @@ import os.log
             logger.info("Dry-run başarılı: [\(path, privacy: .public)]")
         }
 
-        // 5. Tahribat Engeli
+        // 6. Tahribat Engeli
         logger.info("✅ [DRY-RUN] \(validatedStandardizedPaths.count) dosya yolu başarıyla doğrulandı ve simüle edildi.")
         reply(true, nil)
     }
@@ -243,6 +252,92 @@ import os.log
         }
 
         return tokens
+    }
+
+    // MARK: - Servis Boşaltma (Daemon/Agent Unloading)
+
+    /// /Library/LaunchDaemons veya ~/Library/LaunchAgents dizinlerindeki .plist servislerini
+    /// dry-run simülasyonundan ÖNCE bellekten düşürür (unload) ve BTM kaydını temizler.
+    private func unloadLaunchService(atPath path: String) {
+        let isDaemon = path.contains("/LaunchDaemons/")
+        let isAgent = path.contains("/LaunchAgents/")
+        guard isDaemon || isAgent else { return }
+
+        let plistURL = URL(fileURLWithPath: path)
+        let plistName = plistURL.lastPathComponent
+
+        // Plist dosyasından 'Label' oku (varsa)
+        var serviceLabel: String? = nil
+        if let data = try? Data(contentsOf: plistURL),
+           let plistDict = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+            serviceLabel = plistDict["Label"] as? String
+        }
+
+        logger.info("⚙️ [SERVICE UNLOAD] Servis bellekten düşürülüyor: \(path, privacy: .public) | Label: \(serviceLabel ?? plistName)")
+        print("[CleanerXPCService] [SERVICE UNLOAD] Unloading service: \(path) (Label: \(serviceLabel ?? plistName))")
+
+        // 1. SMAppService API ile BTM ve launchd kaydını temizleme
+        if #available(macOS 13.0, *) {
+            if isDaemon {
+                let service = SMAppService.daemon(plistName: plistName)
+                do {
+                    try service.unregister()
+                    logger.info("✅ SMAppService.daemon unregister başarılı: \(plistName)")
+                } catch {
+                    logger.debug("ℹ️ SMAppService.daemon unregister uyarısı: \(error.localizedDescription)")
+                }
+            } else if isAgent {
+                let service = SMAppService.agent(plistName: plistName)
+                do {
+                    try service.unregister()
+                    logger.info("✅ SMAppService.agent unregister başarılı: \(plistName)")
+                } catch {
+                    logger.debug("ℹ️ SMAppService.agent unregister uyarısı: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        // 2. launchctl bootout ve unload komutları ile bellekten düşürme
+        if isDaemon {
+            // System domain bootout
+            _ = runLaunchctl(arguments: ["bootout", "system", path])
+            if let label = serviceLabel, !label.isEmpty {
+                _ = runLaunchctl(arguments: ["bootout", "system/" + label])
+            }
+            _ = runLaunchctl(arguments: ["unload", "-w", path])
+        } else if isAgent {
+            // Aktif konsol kullanıcısının UID'sini bul
+            var statBuf = stat()
+            let consoleUID: uid_t = (stat("/dev/console", &statBuf) == 0) ? statBuf.st_uid : 501
+
+            // GUI domain bootout
+            _ = runLaunchctl(arguments: ["bootout", "gui/\(consoleUID)", path])
+            if let label = serviceLabel, !label.isEmpty {
+                _ = runLaunchctl(arguments: ["bootout", "gui/\(consoleUID)/" + label])
+            }
+            _ = runLaunchctl(arguments: ["unload", "-w", path])
+        }
+
+        logger.info("🏁 [SERVICE UNLOAD] Servis boşaltma işlemi tamamlandı: \(path, privacy: .public)")
+        print("[CleanerXPCService] [SERVICE UNLOAD] Unload completed: \(path)")
+    }
+
+    @discardableResult
+    private func runLaunchctl(arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
     }
 
     // MARK: - NSXPCListenerDelegate

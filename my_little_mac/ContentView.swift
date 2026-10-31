@@ -25,10 +25,24 @@ final class ContentViewModel {
     var deletionSuccessMessage: String?
     var isWaitingForApproval: Bool = false
     var pendingDeletionFiles: [ScannedFile] = []
+    var lastAuditLogURL: URL?
 
-    private let scannerService = ScannerService()
-    private let analyzerService = AnalyzerService()
-    private let xpcConnectionManager = XPCConnectionManager()
+    @ObservationIgnored private let scannerService = ScannerService()
+    @ObservationIgnored private let analyzerService = AnalyzerService()
+    @ObservationIgnored private let xpcConnectionManager: XPCConnectionManager
+    @ObservationIgnored private let auditLogService = AuditLogService()
+    @ObservationIgnored private let lifecycleService: ProcessLifecycleService
+
+    init(xpcConnectionManager: XPCConnectionManager = XPCConnectionManager()) {
+        self.xpcConnectionManager = xpcConnectionManager
+        self.lifecycleService = ProcessLifecycleService(xpcConnectionManager: xpcConnectionManager)
+    }
+
+    func openLogsDirectory() {
+        if let url = try? auditLogService.getOrCreateLogsDirectory() {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     func openSystemSettings() {
         xpcConnectionManager.openSystemSettingsForApproval()
@@ -70,14 +84,20 @@ final class ContentViewModel {
         scannedApp?.relatedFiles.filter { $0.isSelectedForDeletion } ?? []
     }
 
-    // MARK: - XPC IPC Köprü Metodu (UI & İletişim Bariyeri)
+    // MARK: - XPC IPC Köprü Metodu (UI, Yaşam Döngüsü & İletişim Bariyeri)
 
-    /// SADECE `isSelectedForDeletion == true` olan [ScannedFile] objelerinin mutlak fiziksel yollarını (`[String]`)
-    /// filtreleyip XPC servisine gönderen köprü metodu.
+    /// SADECE `isSelectedForDeletion == true` olan [ScannedFile] objelerini ProcessLifecycleService üzerinden işler.
+    /// Canlı süreçleri (live processes) sonlandırır, onaylanmış .plist servislerini unload eder ve
+    /// fiziksel yolları (`[String]`) XPC servisine gönderip dry-run simülasyonunu tamamlar.
     /// Ortak kullanım şüphesi olan, belirsiz (.unknown) veya kilitli (seçilmemiş) hiçbir dosya yolu
-    /// KESİNLİKLE IPC iletişim paketine (payload) dahil edilemez.
+    /// KESİNLİKLE IPC iletişim paketine (payload) dahil edilemez ve servisleri bellekten düşürülemez.
     @MainActor
     func requestDeletion(files: [ScannedFile]) async {
+        guard let currentApp = scannedApp, !currentApp.bundleIdentifier.isEmpty else {
+            deletionError = "Hedef uygulamanın Bundle ID'si belirlenemedi."
+            return
+        }
+
         // UI Güvenlik Bariyeri: Yalnızca isSelectedForDeletion == true olan VE
         // belirsiz, yüksek riskli veya ortak kullanım şüphesi taşımayan
         // (.unknown, .highRisk, .sharedDependency OLMAYAN)
@@ -92,12 +112,9 @@ final class ContentViewModel {
 
         // Kilitli / seçilmemiş hiçbir dosya yolu iletilemez; liste boşsa durdur
         guard !approvedPaths.isEmpty else {
-            return
-        }
-
-        // Hedef uygulamanın Bundle ID'sini doğrula
-        guard let bundleID = scannedApp?.bundleIdentifier, !bundleID.isEmpty else {
-            deletionError = "Hedef uygulamanın Bundle ID'si belirlenemedi."
+            if !files.isEmpty {
+                deletionError = "Silinmek üzere onaylanmış güvenli dosya bulunamadı. Yüksek riskli (.highRisk), ortak (.sharedDependency) veya bilinmeyen (.unknown) dosyalar doğrudan temizlenemez."
+            }
             return
         }
 
@@ -106,17 +123,51 @@ final class ContentViewModel {
         deletionSuccessMessage = nil
 
         do {
-            let success = try await xpcConnectionManager.verifyAndPrepareDeletion(bundleID: bundleID, paths: approvedPaths)
-            if success {
-                deletionSuccessMessage = "\(approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
+            let report = try await lifecycleService.executeLifecycleAndDryRun(
+                for: currentApp,
+                files: files
+            )
 
-                // Ajanlar Arası İletişim: Helper'dan dönen başarılı sonucu [ScannedFile] modellerinin durumunu UI'da güncellemek için kullan
-                let approvedSet = Set(approvedPaths)
-                if let currentApp = scannedApp {
-                    for index in currentApp.relatedFiles.indices {
-                        if approvedSet.contains(currentApp.relatedFiles[index].url.standardizedFileURL.path) {
-                            scannedApp?.relatedFiles[index].isSelectedForDeletion = false
-                        }
+            if report.isHelperDryRunSuccessful {
+                // Ajanlar Arası İletişim (Veri Protokolü):
+                // XPC servisinden ve Lifecycle ajanından dönen olumlu sonuçlar, Raporlama/Denetim ajanına
+                // KESİNLİKLE [ScannedFile] listesi ve sonlandırılan canlı süreçler olarak aktarılır.
+                do {
+                    let logURL = try auditLogService.recordDryRunAuditLog(
+                        for: currentApp,
+                        verifiedFiles: report.approvedFiles,
+                        helperStatus: xpcConnectionManager.daemonStatus(),
+                        terminatedProcesses: report.terminatedProcesses
+                    )
+                    lastAuditLogURL = logURL
+
+                    var successMsg = "\(report.approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
+
+                    if !report.terminatedProcesses.isEmpty {
+                        let procDetails = report.terminatedProcesses.map { proc in
+                            let mode = proc.wasGraceful ? "Zarif (terminate)" : "Zorla (forceTerminate)"
+                            return "• \(proc.processName) (PID: \(proc.pid), \(mode))"
+                        }.joined(separator: "\n")
+                        successMsg += "\n\n⚡ Sonlandırılan Canlı Süreçler (\(report.terminatedProcesses.count) adet):\n\(procDetails)"
+                    }
+
+                    if !report.approvedPlistFiles.isEmpty {
+                        let plistNames = report.approvedPlistFiles.map { "• \($0.url.lastPathComponent)" }.joined(separator: "\n")
+                        successMsg += "\n\n🛑 Bellekten Düşürülen Servisler (\(report.approvedPlistFiles.count) adet):\n\(plistNames)"
+                    }
+
+                    successMsg += "\n\n📄 Denetim Günlüğü Kaydedildi:\n\(logURL.path)"
+                    deletionSuccessMessage = successMsg
+                } catch {
+                    deletionSuccessMessage = "\(report.approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
+                    deletionError = "Denetim günlüğü kaydedilemedi: \(error.localizedDescription)"
+                }
+
+                // Helper'dan dönen başarılı sonucu [ScannedFile] modellerinin durumunu UI'da güncellemek için kullan
+                let approvedSet = Set(report.approvedPaths)
+                for index in currentApp.relatedFiles.indices {
+                    if approvedSet.contains(currentApp.relatedFiles[index].url.standardizedFileURL.path) {
+                        scannedApp?.relatedFiles[index].isSelectedForDeletion = false
                     }
                 }
             }
@@ -131,6 +182,8 @@ final class ContentViewModel {
         } catch {
             deletionError = error.localizedDescription
         }
+
+        isDeleting = false
 
         isDeleting = false
     }
@@ -245,6 +298,11 @@ struct ContentView: View {
             get: { viewModel.deletionSuccessMessage != nil },
             set: { if !$0 { viewModel.deletionSuccessMessage = nil } }
         )) {
+            if let logURL = viewModel.lastAuditLogURL {
+                Button("Denetim Günlüğünü Göster") {
+                    NSWorkspace.shared.activateFileViewerSelecting([logURL])
+                }
+            }
             Button("Tamam", role: .cancel) {}
         } message: {
             if let msg = viewModel.deletionSuccessMessage {
@@ -330,6 +388,17 @@ struct ContentView: View {
                                 .font(.caption)
                         }
                         .buttonStyle(.bordered)
+
+                        // Son Denetim Günlüğü Butonu (.json)
+                        if let logURL = viewModel.lastAuditLogURL {
+                            Button {
+                                NSWorkspace.shared.activateFileViewerSelecting([logURL])
+                            } label: {
+                                Label("Denetim Günlüğü (.json)", systemImage: "doc.badge.gearshape")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                        }
 
                         // Yeni uygulama seçmek için küçük buton
                         Button {
@@ -677,6 +746,10 @@ struct FileRowView: View {
         switch method {
         case .standard:
             return "Keşif: Standart Tarama"
+        case .spotlight:
+            return "Keşif: Spotlight (mdfind)"
+        case .pkgutil:
+            return "Keşif: PKG Makbuz (pkgutil)"
         case .teamID:
             return "Keşif: Team ID Paylaşımı"
         case .btm:
