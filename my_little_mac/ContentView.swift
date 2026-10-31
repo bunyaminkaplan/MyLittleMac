@@ -23,10 +23,29 @@ final class ContentViewModel {
     var isDeleting: Bool = false
     var deletionError: String?
     var deletionSuccessMessage: String?
+    var isWaitingForApproval: Bool = false
+    var pendingDeletionFiles: [ScannedFile] = []
 
     private let scannerService = ScannerService()
     private let analyzerService = AnalyzerService()
     private let xpcConnectionManager = XPCConnectionManager()
+
+    func openSystemSettings() {
+        xpcConnectionManager.openSystemSettingsForApproval()
+    }
+
+    func cancelPendingDeletion() {
+        isWaitingForApproval = false
+        pendingDeletionFiles = []
+    }
+
+    @MainActor
+    func retryPendingDeletion() async {
+        isWaitingForApproval = false
+        let files = pendingDeletionFiles
+        pendingDeletionFiles = []
+        await requestDeletion(files: files)
+    }
 
     /// Sadece `isSelectedForDeletion == true` olan dosyaların toplam boyutu.
     var totalSelectedSize: Int64 {
@@ -55,16 +74,30 @@ final class ContentViewModel {
 
     /// SADECE `isSelectedForDeletion == true` olan [ScannedFile] objelerinin mutlak fiziksel yollarını (`[String]`)
     /// filtreleyip XPC servisine gönderen köprü metodu.
-    /// Kilitli (seçilmemiş) hiçbir dosya yolu KESİNLİKLE IPC üzerinden Helper'a iletilemez.
+    /// Ortak kullanım şüphesi olan, belirsiz (.unknown) veya kilitli (seçilmemiş) hiçbir dosya yolu
+    /// KESİNLİKLE IPC iletişim paketine (payload) dahil edilemez.
     @MainActor
     func requestDeletion(files: [ScannedFile]) async {
-        // İletişim Bariyeri: Yalnızca isSelectedForDeletion == true olanların mutlak path'lerini filtrele
-        let approvedPaths: [String] = files
-            .filter { $0.isSelectedForDeletion }
-            .map { $0.url.standardizedFileURL.path }
+        // UI Güvenlik Bariyeri: Yalnızca isSelectedForDeletion == true olan VE
+        // belirsiz, yüksek riskli veya ortak kullanım şüphesi taşımayan
+        // (.unknown, .highRisk, .sharedDependency OLMAYAN)
+        // mutlak sahiplik kanıtı olan dosyaları filtrele.
+        let approvedFiles = files.filter {
+            $0.isSelectedForDeletion &&
+            $0.riskLevel != .unknown &&
+            $0.riskLevel != .highRisk &&
+            $0.riskLevel != .sharedDependency
+        }
+        let approvedPaths: [String] = approvedFiles.map { $0.url.standardizedFileURL.path }
 
         // Kilitli / seçilmemiş hiçbir dosya yolu iletilemez; liste boşsa durdur
         guard !approvedPaths.isEmpty else {
+            return
+        }
+
+        // Hedef uygulamanın Bundle ID'sini doğrula
+        guard let bundleID = scannedApp?.bundleIdentifier, !bundleID.isEmpty else {
+            deletionError = "Hedef uygulamanın Bundle ID'si belirlenemedi."
             return
         }
 
@@ -73,9 +106,27 @@ final class ContentViewModel {
         deletionSuccessMessage = nil
 
         do {
-            let success = try await xpcConnectionManager.verifyAndPrepareDeletion(paths: approvedPaths)
+            let success = try await xpcConnectionManager.verifyAndPrepareDeletion(bundleID: bundleID, paths: approvedPaths)
             if success {
-                deletionSuccessMessage = "\(approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve hazırlandı (simülasyon)."
+                deletionSuccessMessage = "\(approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
+
+                // Ajanlar Arası İletişim: Helper'dan dönen başarılı sonucu [ScannedFile] modellerinin durumunu UI'da güncellemek için kullan
+                let approvedSet = Set(approvedPaths)
+                if let currentApp = scannedApp {
+                    for index in currentApp.relatedFiles.indices {
+                        if approvedSet.contains(currentApp.relatedFiles[index].url.standardizedFileURL.path) {
+                            scannedApp?.relatedFiles[index].isSelectedForDeletion = false
+                        }
+                    }
+                }
+            }
+        } catch let error as XPCConnectionError {
+            if case .requiresApproval = error {
+                pendingDeletionFiles = approvedFiles
+                isWaitingForApproval = true
+                deletionError = nil
+            } else {
+                deletionError = error.localizedDescription
             }
         } catch {
             deletionError = error.localizedDescription
@@ -209,6 +260,21 @@ struct ContentView: View {
             if let err = viewModel.deletionError {
                 Text(err)
             }
+        }
+        .alert("⚠️ Privileged Helper İzni Gerekiyor", isPresented: $viewModel.isWaitingForApproval) {
+            Button("İzni Verdim, Tekrar Dene") {
+                Task {
+                    await viewModel.retryPendingDeletion()
+                }
+            }
+            Button("Sistem Ayarlarını Aç") {
+                viewModel.openSystemSettings()
+            }
+            Button("Vazgeç", role: .cancel) {
+                viewModel.cancelPendingDeletion()
+            }
+        } message: {
+            Text("Privileged Helper servisinin çalışabilmesi için macOS Sistem Ayarları > Giriş Öğeleri ve Uzantılar panelinden 'bunyamin.my-little-mac.helper' servisine izin verilmesi gerekmektedir.\n\nİzni verdikten sonra 'İzni Verdim, Tekrar Dene' butonuna tıklayınız.")
         }
     }
 
