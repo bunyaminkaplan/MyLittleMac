@@ -383,7 +383,37 @@ final class HelperIdleTimer {
             )
         }
 
-        // 6. Sahiplik (Ownership) doğrulaması
+        // 6. Sahiplik (Ownership) Doğrulaması
+        let isAppBundle = standardized.hasSuffix(".app")
+        let isInApplications = standardized.hasPrefix("/Applications/") ||
+                               standardized.hasPrefix("/System/Applications/") ||
+                               standardized.hasPrefix(homeDir + "/Applications/") ||
+                               (standardized.hasPrefix("/Users/") && standardized.contains("/Applications/"))
+
+        // 1. Ana Paket (App Bundle) İstisnası:
+        // Eğer gelen dosya yolu KESİNLİKLE .app uzantısıyla bitiyorsa ve ana uygulamanın
+        // /Applications/ dizinindeki fiziksel yoluyla birebir aynıysa,
+        // bu yol için bundleID string eşleşmesi kontrolünü atla (bypass) ve yolu güvenli kabul et.
+        if isAppBundle && isInApplications {
+            // A. Eğer paketin CFBundleIdentifier bilgisi doğrudan hedef bundleID ile eşleşiyorsa tam güvenle onayla
+            if let bundle = Bundle(path: standardized),
+               let actualBundleID = bundle.bundleIdentifier,
+               actualBundleID.caseInsensitiveCompare(bundleID) == .orderedSame {
+                logger.info("📦 [App Bundle Doğrulandı] .app paketi bundleID (\(bundleID, privacy: .public)) ile tam eşleşti: \(standardized, privacy: .public)")
+                return standardized
+            }
+
+            // B. /Applications/ altındaki ana paket (.app) için bundleID string eşleşme kontrolünü atla
+            let pathComponents = URL(fileURLWithPath: standardized).pathComponents
+            if pathComponents.count <= 6 {
+                logger.info("📦 [App Bundle Bypass] /Applications/ altındaki ana paket (.app) güvenlik filtresinden onaylandı: \(standardized, privacy: .public)")
+                return standardized
+            }
+        }
+
+        // 2. Alt Dizin Korumasının Sürdürülmesi:
+        // Ana paket (.app) dışındaki tüm yollar (~/Library/Application Support, /Library/Preferences vb.)
+        // için mevcut sıkı bundleID veya üretici (vendor) string eşleşmesi kuralını aynı şekilde KORUMAYA DEVAM ET.
         let lowercasedPath = standardized.lowercased()
         let isMatched = targetTokens.contains { token in
             lowercasedPath.contains(token)
