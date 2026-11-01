@@ -56,6 +56,9 @@ struct AuditUserAuthorizationInfo: Codable {
     let isAdministrator: Bool
     let privilegedHelperStatus: String
     let isPrivilegedHelperAuthorized: Bool
+    let helperPID: Int?
+    let helperUID: Int?
+    let isRootExecutionVerified: Bool
     let authorizationScope: String
 }
 
@@ -126,7 +129,9 @@ final class AuditLogService {
         for app: ScannedApp,
         verifiedFiles: [ScannedFile],
         helperStatus: SMAppService.Status,
-        terminatedProcesses: [ProcessTerminationInfo] = []
+        terminatedProcesses: [ProcessTerminationInfo] = [],
+        helperPID: Int? = nil,
+        helperUID: Int? = nil
     ) throws -> URL {
         // UI Güvenlik Bariyeri & Ajanlar Arası İletişim Protokolü:
         // Yalnızca isSelectedForDeletion == true olan VE
@@ -171,15 +176,20 @@ final class AuditLogService {
             isHelperAuthorized = false
         }
 
+        let isRootVerified = (helperUID == 0)
+
         let userAuth = AuditUserAuthorizationInfo(
             username: username,
             userID: uid,
             isAdministrator: isAdmin,
             privilegedHelperStatus: helperStatusStr,
             isPrivilegedHelperAuthorized: isHelperAuthorized,
-            authorizationScope: isHelperAuthorized
-                ? "SMAppService.daemon (Privileged LaunchDaemon / Root)"
-                : "Standart Kullanıcı Seviyesi"
+            helperPID: helperPID,
+            helperUID: helperUID,
+            isRootExecutionVerified: isRootVerified,
+            authorizationScope: isRootVerified
+                ? "SMAppService.daemon (Privileged LaunchDaemon / Root UID: 0 Doğrulandı)"
+                : (isHelperAuthorized ? "SMAppService.daemon (Yetkili)" : "Standart Kullanıcı Seviyesi")
         )
 
         // 2. Hedef Uygulama Bilgisi (CFBundleIdentifier)

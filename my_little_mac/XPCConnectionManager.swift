@@ -10,6 +10,7 @@
 //
 
 import Foundation
+import AppKit
 import ServiceManagement
 import os.log
 
@@ -44,6 +45,22 @@ enum XPCConnectionError: LocalizedError {
     }
 }
 
+// MARK: - Remote Execution Güvenlik Hataları
+
+enum XPCRemoteExecutionError: LocalizedError {
+    case unprivilegedExecution(uid: Int, pid: Int)
+    case proxyConnectionFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unprivilegedExecution(let uid, let pid):
+            return "🛑 [GÜVENLİK İHLALİ] Remote Execution doğrulanamadı: İşlem root (UID: 0) yerine yetkisiz kullanıcı hesabı (UID: \(uid), PID: \(pid)) ile çalıştırıldı. İşlem güvenlik gereği iptal edildi."
+        case .proxyConnectionFailed:
+            return "🛑 [BAĞLANTI HATASI] XPC remoteObjectProxy bağlantısı kurulamadı veya Helper yanıt vermiyor."
+        }
+    }
+}
+
 // MARK: - XPC Connection Manager
 
 /// Ana uygulama ile Privileged Helper Tool arasındaki XPC bağlantısını yönetir.
@@ -57,7 +74,12 @@ final class XPCConnectionManager {
     let daemonPlistName: String
 
     private var connection: NSXPCConnection?
+    private(set) var isConnected: Bool = false
+    private var terminateObserver: NSObjectProtocol?
     private let logger = Logger(subsystem: "bunyamin.my-little-mac", category: "XPCConnectionManager")
+
+    /// Helper bağlantı durumu değiştiğinde tetiklenen callback (UI ajanı bunu dinleyerek eylem butonlarını kilitler).
+    var onConnectionStateChanged: ((Bool) -> Void)?
 
     init(
         machServiceName: String = "bunyamin.my-little-mac.helper",
@@ -65,6 +87,23 @@ final class XPCConnectionManager {
     ) {
         self.machServiceName = machServiceName
         self.daemonPlistName = daemonPlistName
+
+        // Kullanıcı uygulamadan çıktığında (quit) bağlantıyı KESİNLİKLE sonlandır (invalidate)
+        self.terminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.logger.info("🚪 Uygulama kapanıyor (willTerminate). Helper bağlantısı invalidate ediliyor.")
+            self?.invalidateConnection()
+        }
+    }
+
+    deinit {
+        if let observer = terminateObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        invalidateConnection()
     }
 
     // MARK: - Modern Yetkilendirme (SMAppService)
@@ -248,38 +287,63 @@ final class XPCConnectionManager {
         let newConnection = NSXPCConnection(machServiceName: machServiceName, options: .privileged)
         newConnection.remoteObjectInterface = NSXPCInterface(with: CleanerXPCProtocol.self)
 
-        // Invalidation Handler
+        // Invalidation Handler: Helper uykuya geçtiğinde (idle-exit) veya sonlandırıldığında
         newConnection.invalidationHandler = { [weak self] in
-            let msg = "⚠️ XPC bağlantısı geçersiz kılındı (invalidated). Helper servisi sonlandırılmış veya izin verilmemiş olabilir."
+            let msg = "⚠️ XPC bağlantısı geçersiz kılındı (invalidated). Helper uykuya geçmiş (idle-exit) veya sonlandırılmış olabilir."
             self?.logger.warning("\(msg, privacy: .public)")
             print("[XPCConnectionManager] \(msg)")
             self?.connection = nil
+            self?.isConnected = false
+            self?.onConnectionStateChanged?(false)
         }
 
         // Interruption Handler
         newConnection.interruptionHandler = { [weak self] in
-            let msg = "⚠️ XPC bağlantısı kesintiye uğradı (interrupted). Helper yeniden başlatılıyor olabilir."
+            let msg = "⚠️ XPC bağlantısı kesintiye uğradı (interrupted)."
             self?.logger.warning("\(msg, privacy: .public)")
             print("[XPCConnectionManager] \(msg)")
             self?.connection = nil
+            self?.isConnected = false
+            self?.onConnectionStateChanged?(false)
         }
 
         newConnection.resume()
         connection = newConnection
+        isConnected = true
+        onConnectionStateChanged?(true)
 
         logger.info("✅ XPC bağlantısı kuruldu (options: .privileged): \(self.machServiceName)")
         return newConnection
     }
 
-    // MARK: - IPC Doğrulama ve Hazırlık Talebi
+    /// UI üzerinden veya işlem öncesinde bağlantıyı açıkça kurar.
+    func connectManually() throws {
+        _ = try establishConnection()
+    }
 
-    /// UI ve İletişim Bariyeri üzerinden filtrelenmiş mutlak dosya yollarını (`[String]`)
+    // MARK: - IPC Doğrulama ve Hazırlık Talebi (Veri Protokolü: [ScannedFile])
+
+    /// UI ve İletişim Bariyeri üzerinden filtrelenmiş [ScannedFile] (Swift Struct) listesini
     /// hedef uygulamanın bundleID bilgisiyle birlikte Privileged Helper Tool'a iletir.
+    /// Remote Execution Kanıtı: Helper'dan dönen UID değerinin 0 (root) olduğunu KESİNLİKLE doğrular.
+    /// UID 501 (kullanıcı) dönerse veya proxy bağlantısı başarısız olursa işlem derhal iptal edilir.
     /// - Parameters:
     ///   - bundleID: Hedef uygulamanın CFBundleIdentifier değeri.
-    ///   - paths: UI tarafından filtrelenmiş ve onaylanmış mutlak fiziksel dosya yolları.
-    /// - Returns: Helper işlemi onayladığında `true`.
-    func verifyAndPrepareDeletion(bundleID: String, paths: [String]) async throws -> Bool {
+    ///   - files: UI tarafından filtrelenmiş ve onaylanmış [ScannedFile] (Swift Struct) listesi.
+    /// - Returns: `(isSuccess: Bool, pid: Int, uid: Int)`
+    func verifyAndPrepareDeletion(
+        bundleID: String,
+        files: [ScannedFile]
+    ) async throws -> (isSuccess: Bool, pid: Int, uid: Int) {
+        let paths: [String] = files.map { $0.url.standardizedFileURL.path }
+        return try await verifyAndPrepareDeletion(bundleID: bundleID, paths: paths)
+    }
+
+    /// Mutlak dosya yollarını (`[String]`) remoteObjectProxyWithErrorHandler üzerinden Helper'a iletir.
+    func verifyAndPrepareDeletion(
+        bundleID: String,
+        paths: [String]
+    ) async throws -> (isSuccess: Bool, pid: Int, uid: Int) {
         // establishConnection daemon kaydını doğrular ve başarısızsa bağlantıyı başlatmadan throw eder
         let xpcConnection = try establishConnection()
 
@@ -296,33 +360,95 @@ final class XPCConnectionManager {
                 """
                 self?.logger.error("🛑 XPC remoteObjectProxyWithErrorHandler tetiklendi:\n\(detailedError, privacy: .public)")
                 print(detailedError)
-                self?.connection = nil
+                self?.invalidateConnection()
                 continuation.resume(throwing: error)
             }) as? CleanerXPCProtocol else {
                 let unavailableMsg = "🛑 [XPC PROXY UNAVAILABLE] XPC remoteObjectProxy nesnesi CleanerXPCProtocol protokolüne cast edilemedi veya helper yanıt vermiyor."
                 self.logger.error("\(unavailableMsg, privacy: .public)")
                 print(unavailableMsg)
-                self.connection = nil
-                continuation.resume(throwing: XPCConnectionError.proxyUnavailable)
+                self.invalidateConnection()
+                continuation.resume(throwing: XPCRemoteExecutionError.proxyConnectionFailed)
                 return
             }
 
-            proxy.verifyAndPrepareDeletion(bundleID: bundleID, paths: paths) { success, error in
+            proxy.verifyAndPrepareDeletion(bundleID: bundleID, paths: paths) { [weak self] success, pid, uid, error in
+                // Ajanlar Arası İletişim (Veri Protokolü):
+                // Yanıt (Bool, Int, Int, Error?) formatında dinlenir. İletim bittiğinde invalidate devreye girer.
+                self?.invalidateConnection()
+
                 if let error = error {
                     continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: success)
+                    return
                 }
+
+                // 2. Remote Execution (Uzaktan Yürütme) Kanıtı:
+                // Ana uygulama, dönen UID değerinin 0 (root) olduğunu doğrulamadan dry-run sonucunu başarılı kabul edemez.
+                // UID 501 (kullanıcı) dönerse veya proxy başarısız olursa işlem derhal iptal edilmelidir.
+                guard uid == 0 else {
+                    let unprivError = XPCRemoteExecutionError.unprivilegedExecution(uid: uid, pid: pid)
+                    self?.logger.error("🛑 [GÜVENLİK İHLALİ] Remote Execution reddedildi: UID=\(uid) != 0 (root değil!). PID=\(pid)")
+                    continuation.resume(throwing: unprivError)
+                    return
+                }
+
+                guard success else {
+                    let failureError = NSError(
+                        domain: "CleanerXPCSecurity",
+                        code: 99,
+                        userInfo: [NSLocalizedDescriptionKey: "Helper dry-run simülasyonu başarısız oldu."]
+                    )
+                    continuation.resume(throwing: failureError)
+                    return
+                }
+
+                self?.logger.info("✅ [Remote Execution Doğrulandı] Root Helper (UID: \(uid), PID: \(pid)) dry-run onayladı.")
+                continuation.resume(returning: (isSuccess: true, pid: pid, uid: uid))
             }
         }
     }
 
-    // MARK: - Bağlantı Temizliği
+    /// XPC proxy üzerinden Helper sürecinin root yetkisini (UID: 0) ve PID kimliğini doğrular.
+    func verifyRootAuthority() async throws -> (isRoot: Bool, pid: Int, uid: Int) {
+        let xpcConnection = try establishConnection()
 
-    /// Mevcut XPC bağlantısını kapatır ve kaynakları serbest bırakır.
-    func disconnect() {
-        connection?.invalidate()
+        return try await withCheckedThrowingContinuation { continuation in
+            guard let proxy = xpcConnection.remoteObjectProxyWithErrorHandler({ [weak self] error in
+                self?.logger.error("🛑 XPC remoteObjectProxy root kontrol hatası: \(error.localizedDescription)")
+                self?.invalidateConnection()
+                continuation.resume(throwing: error)
+            }) as? CleanerXPCProtocol else {
+                self.invalidateConnection()
+                continuation.resume(throwing: XPCRemoteExecutionError.proxyConnectionFailed)
+                return
+            }
+
+            proxy.checkRootAuthority { isRoot, pid, uid in
+                continuation.resume(returning: (isRoot: isRoot, pid: pid, uid: uid))
+            }
+        }
+    }
+
+    // MARK: - Bağlantı Sonlandırma (Invalidation & Kaynak Yönetimi)
+
+    /// Mevcut XPC bağlantısını KESİNLİKLE sonlandırır (`connection?.invalidate()`) ve kaynakları serbest bırakır.
+    /// IPC paketinin iletimi bittiğinde, denetim günlüğü kaydedildiğinde veya kullanıcı uygulamadan çıktığında çağrılır.
+    func invalidateConnection() {
+        if let conn = connection {
+            conn.invalidationHandler = nil
+            conn.interruptionHandler = nil
+            conn.invalidate()
+        }
         connection = nil
-        logger.info("🔌 XPC bağlantısı kapatıldı.")
+        let wasConnected = isConnected
+        isConnected = false
+        if wasConnected {
+            logger.info("🔌 [XPC Invalidation] connection?.invalidate() çağrıldı. Bellek kaynakları serbest bırakıldı.")
+            onConnectionStateChanged?(false)
+        }
+    }
+
+    /// Mevcut XPC bağlantısını kapatır (invalidateConnection alias).
+    func disconnect() {
+        invalidateConnection()
     }
 }

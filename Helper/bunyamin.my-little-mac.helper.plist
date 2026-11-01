@@ -15,5 +15,9 @@
     <array>
         <string>Contents/MacOS/bunyamin.my-little-mac.helper</string>
     </array>
+    <key>EnableTransactions</key>
+    <true/>
+    <key>EnablePressuredExit</key>
+    <true/>
 </dict>
 </plist>

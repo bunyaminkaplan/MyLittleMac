@@ -1,10 +1,12 @@
 //
 //  CleanerXPCService.swift
-//  my_little_mac
+//  bunyamin.my-little-mac.helper
 //
 //  XPC Privileged Helper Architecture: Privileged Helper Tool tarafında çalışan XPC servisi.
+//  Target İzolasyonu: Sadece Helper hedefinde derlenir; ana uygulamadan KESİNLİKLE izoledir.
 //  Gelen [String] dosya yolu dizisini bundleID bağlamında güvenlik denetiminden
 //  (Mutlak Yol, Path Traversal, Kritik Sistem Dizinleri, Sahiplik) geçirir.
+//  Remote Execution Kanıtı: PID ve UID (root: 0) değerlerini döner.
 //  Silinebilirlik Kontrolü (Dry-Run): FileManager.default.isDeletableFile(atPath:) ile simülasyon.
 //  Tahribat Engeli: Fiziksel silme kodu İÇERMEZ — sadece log basıp mock başarı döner.
 //
@@ -14,9 +16,160 @@ import ServiceManagement
 import Darwin
 import os.log
 
+// MARK: - C os_transaction Köprüsü
+@_silgen_name("os_transaction_create")
+private func os_transaction_create(_ description: UnsafePointer<CChar>) -> AnyObject?
+
+// MARK: - XPC Yaşam Döngüsü ve Kaynak Yönetimi (Idle-Exit Guard)
+
+/// IPC işlemi sırasında aktif bir transaction ve activity tutar.
+/// İşlem tamamlandığında (reply döndüğünde) veya nesne deallocate olduğunda
+/// işlemi sonlandırarak launchd'nin servisi otomatik boşta kapatmasına (idle-exit) olanak tanır.
+final class XPCTransactionGuard {
+    private var transaction: AnyObject?
+    private var activity: NSObjectProtocol?
+    private var isFinished = false
+    private let logger = Logger(subsystem: "bunyamin.my-little-mac.helper", category: "XPCTransactionGuard")
+
+    init(name: String, reason: String) {
+        self.transaction = os_transaction_create(name)
+        self.activity = ProcessInfo.processInfo.beginActivity(
+            options: [.background, .latencyCritical],
+            reason: reason
+        )
+        logger.info("⏱️ [Idle-Exit Guard] Transaction ve Activity başlatıldı: \(name, privacy: .public)")
+    }
+
+    func end() {
+        guard !isFinished else { return }
+        isFinished = true
+        if let act = activity {
+            ProcessInfo.processInfo.endActivity(act)
+            activity = nil
+        }
+        transaction = nil
+        logger.info("💤 [Idle-Exit Guard] Transaction sonlandırıldı. Servis boşta kapanmaya (idle-exit) hazır.")
+    }
+
+    deinit {
+        end()
+    }
+}
+
+// MARK: - DispatchSourceTimer ile Helper Otomatik Kapanma (Idle Timer)
+
+/// Helper hedefi (bunyamin.my-little-mac.helper) için bellek sızıntılarını ve
+/// zombie arka plan süreçlerini önleyen DispatchSourceTimer tabanlı yaşam döngüsü yöneticisi.
+final class HelperIdleTimer {
+    static let shared = HelperIdleTimer()
+
+    private let queue = DispatchQueue(label: "bunyamin.my-little-mac.helper.idletimer", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private var isSuspended = false
+    private let timeoutSeconds: Int
+    private let logger = Logger(subsystem: "bunyamin.my-little-mac.helper", category: "HelperIdleTimer")
+
+    init(timeoutSeconds: Int = 10) {
+        self.timeoutSeconds = timeoutSeconds
+    }
+
+    /// Bağlantı kurulduğunda veya Helper başlatıldığında 10 saniyelik zamanlayıcıyı başlatır / sıfırlar.
+    func startTimer() {
+        queue.sync {
+            cancelInternal()
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now() + .seconds(timeoutSeconds))
+            t.setEventHandler { [weak self] in
+                self?.handleTimeout()
+            }
+            t.resume()
+            timer = t
+            isSuspended = false
+            logger.info("⏱️ [HelperIdleTimer] \(self.timeoutSeconds) saniyelik idle timer başlatıldı.")
+            print("[bunyamin.my-little-mac.helper] [IDLE TIMER] Started \(self.timeoutSeconds)s countdown.")
+        }
+    }
+
+    /// verifyAndPrepareDeletion gibi her XPC fonksiyon çağrısının başlangıcında zamanlayıcıyı askıya alır (suspend).
+    func suspendTimer() {
+        queue.sync {
+            guard let t = timer else { return }
+            if !isSuspended {
+                t.suspend()
+                isSuspended = true
+                logger.info("⏸️ [HelperIdleTimer] XPC işlemi başladı, zamanlayıcı askıya alındı (suspend).")
+                print("[bunyamin.my-little-mac.helper] [IDLE TIMER] Suspended timer during XPC operation.")
+            }
+        }
+    }
+
+    /// İşlem tamamlanıp ana uygulamaya reply dönüldüğünde zamanlayıcıyı yeniden başlatır (resume) ve sıfırlar.
+    func resumeTimer() {
+        queue.sync {
+            guard let t = timer else {
+                cancelInternal()
+                let newTimer = DispatchSource.makeTimerSource(queue: queue)
+                newTimer.schedule(deadline: .now() + .seconds(timeoutSeconds))
+                newTimer.setEventHandler { [weak self] in
+                    self?.handleTimeout()
+                }
+                newTimer.resume()
+                timer = newTimer
+                isSuspended = false
+                return
+            }
+
+            if isSuspended {
+                t.resume()
+                isSuspended = false
+            }
+            t.schedule(deadline: .now() + .seconds(timeoutSeconds))
+            logger.info("▶️ [HelperIdleTimer] XPC işlemi bitti, zamanlayıcı yeniden başlatıldı (resume & \(self.timeoutSeconds)s reset).")
+            print("[bunyamin.my-little-mac.helper] [IDLE TIMER] Resumed and reset countdown to \(self.timeoutSeconds)s.")
+        }
+    }
+
+    /// İletişim koptuğunda (invalidation / interruption) zamanlayıcıyı iptal edip süreci KESİNLİKLE exit(0) ile derhal sonlandırır.
+    func cancelAndExitImmediately(reason: String) {
+        queue.sync {
+            logger.info("🛑 [HelperIdleTimer] \(reason). Süreç exit(0) ile derhal sonlandırılıyor.")
+            print("[bunyamin.my-little-mac.helper] [IMMEDIATE EXIT] Reason: \(reason). Terminating process with exit(0)...")
+            cancelInternal()
+            terminateHelperProcess()
+        }
+    }
+
+    /// 10 saniye boyunca yeni istek gelmediğinde süreci exit(0) ile sonlandırır.
+    private func handleTimeout() {
+        logger.info("💤 [HelperIdleTimer] \(self.timeoutSeconds) saniye boşta kalındı (idle timeout). Süreç exit(0) ile sonlandırılıyor.")
+        print("[bunyamin.my-little-mac.helper] [IDLE TIMEOUT] \(self.timeoutSeconds)s idle timeout reached with no requests. Terminating with exit(0)...")
+        cancelInternal()
+        terminateHelperProcess()
+    }
+
+    private func cancelInternal() {
+        if let t = timer {
+            if isSuspended {
+                t.resume()
+                isSuspended = false
+            }
+            t.cancel()
+            timer = nil
+        }
+    }
+
+    private func terminateHelperProcess() {
+        let processName = ProcessInfo.processInfo.processName
+        if processName != "my_little_mac" {
+            exit(0)
+        }
+    }
+}
+
 // MARK: - CleanerXPCService
 
 /// Privileged Helper Tool olarak çalışan ve CleanerXPCProtocol'ü uygulayan servis.
+/// SADECE Helper sürecinde (bunyamin.my-little-mac.helper) çalışır; ana uygulama target'ında yer almaz.
 @objc public final class CleanerXPCService: NSObject, CleanerXPCProtocol, NSXPCListenerDelegate {
 
     private let logger = Logger(subsystem: "bunyamin.my-little-mac.helper", category: "CleanerXPCService")
@@ -25,12 +178,33 @@ import os.log
 
     /// Gelen mutlak dosya yollarını bundleID bağlamında güvenlik filtresinden geçirir,
     /// silinebilirlik durumunu simüle eder (Dry-Run) ve sonucu ana uygulamaya iletir.
+    /// Remote Execution Kanıtı: PID ve UID değerlerini döner (root UID: 0 zorunludur).
     /// ⛔ Fiziksel dosya silme komutları İÇERMEZ.
     @objc public func verifyAndPrepareDeletion(
         bundleID: String,
         paths: [String],
-        withReply reply: @escaping (Bool, Error?) -> Void
+        withReply reply: @escaping (Bool, Int, Int, Error?) -> Void
     ) {
+        let currentPID = Int(getpid())
+        let currentUID = Int(getuid())
+
+        // 2. İşlem Başına Timer Sıfırlama:
+        HelperIdleTimer.shared.suspendTimer()
+
+        // Yaşam Döngüsü ve Kaynak Yönetimi:
+        let transactionGuard = XPCTransactionGuard(
+            name: "bunyamin.my-little-mac.helper.verifyAndPrepareDeletion",
+            reason: "IPC verifyAndPrepareDeletion for [\(bundleID)] with \(paths.count) paths"
+        )
+
+        // Yanıt döndüğünde KESİNLİKLE işlemi sonlandıran ve zamanlayıcıyı yeniden başlatan güvenli closure
+        let safeReply: (Bool, Error?) -> Void = { success, error in
+            transactionGuard.end()
+            HelperIdleTimer.shared.resumeTimer()
+            // Remote Execution Kanıtı: (Bool, Int, Int, Error?)
+            reply(success, currentPID, currentUID, error)
+        }
+
         // 1. Boş liste kontrolü
         guard !paths.isEmpty else {
             let error = NSError(
@@ -39,7 +213,7 @@ import os.log
                 userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Dosya yolu listesi boş."]
             )
             logger.warning("⚠️ Boş dosya yolu listesi alındı, işlem reddedildi.")
-            reply(false, error)
+            safeReply(false, error)
             return
         }
 
@@ -51,11 +225,11 @@ import os.log
                 userInfo: [NSLocalizedDescriptionKey: "Güvenlik ihlali: Geçersiz bundleID."]
             )
             logger.warning("⚠️ Boş veya geçersiz bundleID alındı, işlem reddedildi.")
-            reply(false, error)
+            safeReply(false, error)
             return
         }
 
-        logger.info("📥 XPC talebi alındı: [\(cleanBundleID)] için \(paths.count) dosya yolu doğrulanacak.")
+        logger.info("📥 XPC talebi alındı: [\(cleanBundleID)] için \(paths.count) dosya yolu doğrulanacak. PID: \(currentPID), UID: \(currentUID)")
 
         // 2. Hedef uygulama belirteçlerini bundleID üzerinden türet
         let targetTokens = deriveTargetTokens(from: cleanBundleID)
@@ -69,7 +243,7 @@ import os.log
             } catch {
                 logger.error("🛑 GÜVENLİK İHLALİ — talep reddedildi: \(rawPath, privacy: .public) | Hata: \(error.localizedDescription)")
                 print("[CleanerXPCService] [SECURITY VIOLATION] Rejected: \(rawPath) - \(error.localizedDescription)")
-                reply(false, error)
+                safeReply(false, error)
                 return
             }
         }
@@ -89,9 +263,18 @@ import os.log
             logger.info("Dry-run başarılı: [\(path, privacy: .public)]")
         }
 
-        // 6. Tahribat Engeli
-        logger.info("✅ [DRY-RUN] \(validatedStandardizedPaths.count) dosya yolu başarıyla doğrulandı ve simüle edildi.")
-        reply(true, nil)
+        // 6. Tahribat Engeli & Başarılı Yanıt (Idle-Exit tetiklenebilir)
+        logger.info("✅ [DRY-RUN] \(validatedStandardizedPaths.count) dosya yolu başarıyla doğrulandı ve simüle edildi. PID=\(currentPID), UID=\(currentUID)")
+        safeReply(true, nil)
+    }
+
+    /// XPC proxy üzerinden Helper sürecinin root yetkisini (UID: 0) doğrular.
+    @objc public func checkRootAuthority(withReply reply: @escaping (Bool, Int, Int) -> Void) {
+        let currentPID = Int(getpid())
+        let currentUID = Int(getuid())
+        let isRoot = (currentUID == 0)
+        logger.info("🔍 [XPC Auth Check] PID: \(currentPID), UID: \(currentUID), isRoot: \(isRoot)")
+        reply(isRoot, currentPID, currentUID)
     }
 
     // MARK: - Güvenlik Duvarı & Doğrulama Katmanı
@@ -234,7 +417,6 @@ import os.log
             if !ignoredTokens.contains(part) && part.count >= 3 {
                 tokens.insert(part)
 
-                // Yaygın macOS eklerini temizle (örn. slackmacgap -> slack, appnameosx -> appname)
                 for suffix in ["macgap", "macos", "osx", "desktop", "client", "helper"] {
                     if part.hasSuffix(suffix) && part.count > suffix.count + 2 {
                         let stripped = String(part.dropLast(suffix.count))
@@ -299,18 +481,15 @@ import os.log
 
         // 2. launchctl bootout ve unload komutları ile bellekten düşürme
         if isDaemon {
-            // System domain bootout
             _ = runLaunchctl(arguments: ["bootout", "system", path])
             if let label = serviceLabel, !label.isEmpty {
                 _ = runLaunchctl(arguments: ["bootout", "system/" + label])
             }
             _ = runLaunchctl(arguments: ["unload", "-w", path])
         } else if isAgent {
-            // Aktif konsol kullanıcısının UID'sini bul
             var statBuf = stat()
             let consoleUID: uid_t = (stat("/dev/console", &statBuf) == 0) ? statBuf.st_uid : 501
 
-            // GUI domain bootout
             _ = runLaunchctl(arguments: ["bootout", "gui/\(consoleUID)", path])
             if let label = serviceLabel, !label.isEmpty {
                 _ = runLaunchctl(arguments: ["bootout", "gui/\(consoleUID)/" + label])
@@ -345,7 +524,21 @@ import os.log
     public func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         newConnection.exportedInterface = NSXPCInterface(with: CleanerXPCProtocol.self)
         newConnection.exportedObject = CleanerXPCService()
+
+        // 3. İletişim Koptuğunda (Invalidation) Anında Kapanma:
+        newConnection.invalidationHandler = {
+            HelperIdleTimer.shared.cancelAndExitImmediately(reason: "CleanerXPCService: Bağlantı geçersiz kılındı (invalidated)")
+        }
+
+        newConnection.interruptionHandler = {
+            HelperIdleTimer.shared.cancelAndExitImmediately(reason: "CleanerXPCService: Bağlantı kesintiye uğradı (interrupted)")
+        }
+
         newConnection.resume()
+
+        // 1. Bağlantı kurulduktan sonra 10 saniyelik boşta kalma zamanlayıcısını başlat
+        HelperIdleTimer.shared.startTimer()
+
         return true
     }
 }

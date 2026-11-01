@@ -3,8 +3,9 @@
 //  my_little_mac
 //
 //  XPC Privileged Helper Architecture: Ana uygulama ile Privileged Helper Tool
-//  arasındaki IPC iletişim protokolü. Veri aktarımı [String] mutlak fiziksel dosya
-//  yolları üzerinden yapılır; Swift struct nesneleri ([ScannedFile]) desteklenmez.
+//  arasındaki IPC iletişim protokolü. İki süreç sadece bu protokol dosyasını paylaşır.
+//  Remote Execution Kanıtı: Helper'dan PID ve UID değerleri döner; ana uygulama
+//  UID == 0 (root) kontrolünü zorunlu kılar.
 //  Fiziksel dosya silme kodu İÇERMEZ.
 //
 
@@ -18,10 +19,20 @@ import Foundation
 protocol CleanerXPCProtocol {
 
     /// Silinecek dosya yollarını hedef uygulamanın bundleID bilgisiyle ana uygulamadan Helper'a aktarır ve güvenlik kontrolünden geçirir.
+    /// Remote Execution Kanıtı: Helper sürecinin PID ve UID değerlerini döner.
     /// - Parameters:
     ///   - bundleID: Hedef uygulamanın CFBundleIdentifier değeri (Örn: "com.google.Chrome").
-    ///   - paths: UI tarafından filtrelenerek gelen (yalnızca isSelectedForDeletion == true)
-    ///            mutlak dosya yollarının `[String]` (NSArray<NSString *>) dizisi.
-    ///   - reply: İşlem sonucu — `(başarılıMı, hata)`.
-    @objc func verifyAndPrepareDeletion(bundleID: String, paths: [String], withReply reply: @escaping (Bool, Error?) -> Void)
+    ///   - paths: UI tarafından onaylanmış mutlak fiziksel dosya yollarının `[String]` dizisi.
+    ///   - reply: İşlem sonucu paketi — `(başarılıMı: Bool, pid: Int, uid: Int, hata: Error?)`.
+    @objc func verifyAndPrepareDeletion(
+        bundleID: String,
+        paths: [String],
+        withReply reply: @escaping (Bool, Int, Int, Error?) -> Void
+    )
+
+    /// XPC proxy üzerinden Helper sürecinin root (UID: 0) yetkisini ve PID kimliğini doğrular.
+    /// - Parameter reply: `(isRoot: Bool, pid: Int, uid: Int)`
+    @objc func checkRootAuthority(
+        withReply reply: @escaping (Bool, Int, Int) -> Void
+    )
 }

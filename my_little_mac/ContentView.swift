@@ -26,6 +26,8 @@ final class ContentViewModel {
     var isWaitingForApproval: Bool = false
     var pendingDeletionFiles: [ScannedFile] = []
     var lastAuditLogURL: URL?
+    var isHelperConnectionActive: Bool = false
+    var isRootVerified: Bool = false
 
     @ObservationIgnored private let scannerService = ScannerService()
     @ObservationIgnored private let analyzerService = AnalyzerService()
@@ -36,6 +38,49 @@ final class ContentViewModel {
     init(xpcConnectionManager: XPCConnectionManager = XPCConnectionManager()) {
         self.xpcConnectionManager = xpcConnectionManager
         self.lifecycleService = ProcessLifecycleService(xpcConnectionManager: xpcConnectionManager)
+        self.isHelperConnectionActive = xpcConnectionManager.isConnected
+        self.isRootVerified = false
+
+        // Helper bağlantı durumu dinleyicisi:
+        // Bağlantı kesildiğinde (invalidated) veya uykuya geçtiğinde UI durumunu günceller.
+        self.xpcConnectionManager.onConnectionStateChanged = { [weak self] isConnected in
+            Task { @MainActor [weak self] in
+                self?.isHelperConnectionActive = isConnected
+                if !isConnected {
+                    self?.isRootVerified = false
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func connectHelper() async {
+        do {
+            try xpcConnectionManager.connectManually()
+            // Remote Execution Kanıtı: XPC proxy üzerinden root (UID: 0) yetkisini doğrula
+            let auth = try await xpcConnectionManager.verifyRootAuthority()
+            if auth.isRoot && auth.uid == 0 {
+                isRootVerified = true
+                isHelperConnectionActive = true
+                deletionError = nil
+            } else {
+                isRootVerified = false
+                isHelperConnectionActive = false
+                deletionError = "🛑 [GÜVENLİK İHLALİ] Remote Execution doğrulanamadı: Helper root (UID: 0) yerine kullanıcı yetkisiyle (UID: \(auth.uid), PID: \(auth.pid)) çalışıyor. İşlem iptal edildi."
+                xpcConnectionManager.invalidateConnection()
+            }
+        } catch {
+            isRootVerified = false
+            isHelperConnectionActive = false
+            deletionError = "Helper bağlantısı kurulamadı veya root yetkisi doğrulanamadı: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    func disconnectHelper() {
+        xpcConnectionManager.invalidateConnection()
+        isHelperConnectionActive = false
+        isRootVerified = false
     }
 
     func openLogsDirectory() {
@@ -58,7 +103,10 @@ final class ContentViewModel {
         isWaitingForApproval = false
         let files = pendingDeletionFiles
         pendingDeletionFiles = []
-        await requestDeletion(files: files)
+        await connectHelper()
+        if isHelperConnectionActive && isRootVerified {
+            await requestDeletion(files: files)
+        }
     }
 
     /// Sadece `isSelectedForDeletion == true` olan dosyaların toplam boyutu.
@@ -93,6 +141,13 @@ final class ContentViewModel {
     /// KESİNLİKLE IPC iletişim paketine (payload) dahil edilemez ve servisleri bellekten düşürülemez.
     @MainActor
     func requestDeletion(files: [ScannedFile]) async {
+        // UI Güvenlik Bariyeri: Helper bağlantısı kapalıyken veya root yetkisi doğrulanamamışsa
+        // arayüzden tetiklenen hiçbir [ScannedFile] (risk düzeyi ne olursa olsun) Helper'a gönderilemez!
+        guard isHelperConnectionActive && isRootVerified else {
+            deletionError = "🛑 UI Güvenlik Bariyeri: XPC proxy üzerinden root yetkisi (UID: 0) doğrulanamadığı sürece işlem başlatılamaz. Lütfen önce Helper bağlantısını kurup root yetkisini doğrulayın."
+            return
+        }
+
         guard let currentApp = scannedApp, !currentApp.bundleIdentifier.isEmpty else {
             deletionError = "Hedef uygulamanın Bundle ID'si belirlenemedi."
             return
@@ -137,11 +192,19 @@ final class ContentViewModel {
                         for: currentApp,
                         verifiedFiles: report.approvedFiles,
                         helperStatus: xpcConnectionManager.daemonStatus(),
-                        terminatedProcesses: report.terminatedProcesses
+                        terminatedProcesses: report.terminatedProcesses,
+                        helperPID: report.helperPID,
+                        helperUID: report.helperUID
                     )
                     lastAuditLogURL = logURL
 
-                    var successMsg = "\(report.approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
+                    // Rule 2: Denetim günlüğünü (Audit Log) başarıyla kaydettiğinde
+                    // XPCConnectionManager sınıfı KESİNLİKLE connection?.invalidate() çağrısını tetikler.
+                    xpcConnectionManager.invalidateConnection()
+                    isHelperConnectionActive = false
+                    isRootVerified = false
+
+                    var successMsg = "\(report.approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı).\n🛡️ Remote Execution Kanıtı: Root UID: \(report.helperUID), Helper PID: \(report.helperPID)"
 
                     if !report.terminatedProcesses.isEmpty {
                         let procDetails = report.terminatedProcesses.map { proc in
@@ -159,6 +222,9 @@ final class ContentViewModel {
                     successMsg += "\n\n📄 Denetim Günlüğü Kaydedildi:\n\(logURL.path)"
                     deletionSuccessMessage = successMsg
                 } catch {
+                    xpcConnectionManager.invalidateConnection()
+                    isHelperConnectionActive = false
+                    isRootVerified = false
                     deletionSuccessMessage = "\(report.approvedPaths.count) dosya yolu Privileged Helper tarafından doğrulandı ve simüle edildi (Dry-run başarılı)."
                     deletionError = "Denetim günlüğü kaydedilemedi: \(error.localizedDescription)"
                 }
@@ -172,6 +238,9 @@ final class ContentViewModel {
                 }
             }
         } catch let error as XPCConnectionError {
+            xpcConnectionManager.invalidateConnection()
+            isHelperConnectionActive = false
+            isRootVerified = false
             if case .requiresApproval = error {
                 pendingDeletionFiles = approvedFiles
                 isWaitingForApproval = true
@@ -180,10 +249,11 @@ final class ContentViewModel {
                 deletionError = error.localizedDescription
             }
         } catch {
+            xpcConnectionManager.invalidateConnection()
+            isHelperConnectionActive = false
+            isRootVerified = false
             deletionError = error.localizedDescription
         }
-
-        isDeleting = false
 
         isDeleting = false
     }
@@ -221,9 +291,19 @@ final class ContentViewModel {
             // Adım 2: AnalyzerService ile risk analizi
             let analyzedFiles = try await analyzerService.analyze(files: scannedFiles, for: app)
 
-            // Analiz sonuçlarını ScannedApp'e yerleştir
-            app.relatedFiles = analyzedFiles
+            // UI Güvenlik Bariyeri:
+            // Mutlak sahiplik kanıtı olmayan, belirsiz (.unknown), ortak kullanım şüphesi taşıyan (.sharedDependency)
+            // veya sistem için riskli olan (.highRisk) TÜM dosyalar varsayılan olarak "SEÇİLMEMİŞ" (isSelectedForDeletion = false) başlatılır.
+            let securedFiles = analyzedFiles.map { file -> ScannedFile in
+                var item = file
+                if item.riskLevel != .safeToDelete {
+                    item.isSelectedForDeletion = false
+                }
+                return item
+            }
 
+            // Analiz sonuçlarını ScannedApp'e yerleştir
+            app.relatedFiles = securedFiles
             scannedApp = app
         } catch {
             scanError = error.localizedDescription
@@ -531,6 +611,39 @@ struct ContentView: View {
 
     private var footerSection: some View {
         VStack(spacing: 12) {
+            // ── Helper Bağlantı ve Yaşam Döngüsü Kontrol Paneli ──
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(viewModel.isRootVerified ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+
+                Text(viewModel.isRootVerified ? "Helper: Aktif (Root UID: 0 Doğrulandı)" : (viewModel.isHelperConnectionActive ? "Helper: Aktif (Root Doğrulanıyor...)" : "Helper Bağlantısı: Kapalı / Root Doğrulanmadı"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if viewModel.isHelperConnectionActive {
+                    Button("Bağlantıyı Kapat (Idle)") {
+                        viewModel.disconnectHelper()
+                    }
+                    .font(.caption2)
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isDeleting)
+                } else {
+                    Button("Helper'a Bağlan & Yetki Doğrula") {
+                        Task {
+                            await viewModel.connectHelper()
+                        }
+                    }
+                    .font(.caption2)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .disabled(viewModel.isDeleting)
+                }
+            }
+            .padding(.horizontal, 4)
+
             // Advanced Mode Toggle — kilitli dosyaları seçime açar
             Toggle(isOn: $viewModel.isAdvancedModeUnlocked) {
                 HStack(spacing: 4) {
@@ -558,7 +671,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
-            .disabled(viewModel.selectedFiles.isEmpty || viewModel.isDeleting)
+            .disabled(viewModel.selectedFiles.isEmpty || viewModel.isDeleting || !viewModel.isHelperConnectionActive || !viewModel.isRootVerified)
         }
         .padding()
     }

@@ -33,6 +33,9 @@ struct LifecycleOperationReport {
     let approvedFiles: [ScannedFile]
     let approvedPaths: [String]
     let isHelperDryRunSuccessful: Bool
+    let helperPID: Int
+    let helperUID: Int
+    let isRootVerified: Bool
     let timestamp: Date
 }
 
@@ -164,9 +167,10 @@ final class ProcessLifecycleService {
         let terminatedProcesses = await terminateRunningProcesses(for: app.bundleIdentifier)
 
         // Adım 2: XPC Privileged Helper üzerinden Servis Boşaltma ve Dry-Run Simülasyonu
-        let success = try await xpcConnectionManager.verifyAndPrepareDeletion(
+        // Ajan, remoteObjectProxy üzerinden haberleşirken KESİNLİKLE sadece [ScannedFile] listesi gönderecektir.
+        let result = try await xpcConnectionManager.verifyAndPrepareDeletion(
             bundleID: app.bundleIdentifier,
-            paths: approvedPaths
+            files: approvedFiles
         )
 
         return LifecycleOperationReport(
@@ -176,7 +180,10 @@ final class ProcessLifecycleService {
             approvedPlistFiles: approvedPlistFiles,
             approvedFiles: approvedFiles,
             approvedPaths: approvedPaths,
-            isHelperDryRunSuccessful: success,
+            isHelperDryRunSuccessful: result.isSuccess,
+            helperPID: result.pid,
+            helperUID: result.uid,
+            isRootVerified: (result.uid == 0),
             timestamp: Date()
         )
     }
